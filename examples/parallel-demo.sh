@@ -8,7 +8,8 @@ BOX1="demoa$$"
 BOX2="demob$$"
 
 cleanup() {
-  "$BIN" down "$BOX1" "$BOX2" >/dev/null 2>&1 || true
+  "$BIN" down "$BOX1" >/dev/null 2>&1 || true
+  "$BIN" down "$BOX2" >/dev/null 2>&1 || true
   rm -rf "$OUT_DIR"
 }
 trap cleanup EXIT
