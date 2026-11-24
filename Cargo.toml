@@ -2,8 +2,17 @@
 name = "agent-box"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.87"
 license = "MIT"
 description = "Parallel, disposable computer-use desktops for agents, each signed in like the user's main browser profile"
+repository = "https://github.com/justcarlson/agent-box"
+keywords = ["agents", "computer-use", "browser", "xvfb", "linux"]
+categories = ["command-line-utilities", "development-tools"]
+
+[package.metadata.binstall]
+pkg-url = "https://github.com/justcarlson/agent-box/releases/download/v{ version }/agent-box-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
 
 [dependencies]
 aes = "0.8"
@@ -12,10 +21,12 @@ cbc = { version = "0.1", features = ["alloc"] }
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+png = "0.18"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha1 = "0.10"
 sha2 = "0.10"
+x11rb = { version = "0.14", default-features = false }
 
 [profile.release]
 lto = "thin"
