@@ -1,4 +1,4 @@
-# PR-body lint from Silent-Cartographer ai/tools/pr/pr-body.yml. Only runs-on may differ.
+# PR-body structure lint workflow.
 name: pr-body
 
 on:

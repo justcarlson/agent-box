@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.87"
 license = "MIT"
+readme = "README.md"
 description = "Parallel, disposable computer-use desktops for agents, each signed in like the user's main browser profile"
 repository = "https://github.com/justcarlson/agent-box"
 keywords = ["agents", "computer-use", "browser", "xvfb", "linux"]
