@@ -1,0 +1,125 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 368" width="980" height="368" role="img" aria-label="agent-box architecture: host session stays untouched while agent-box up clones the browser profile via FICLONE and re-encrypts cookies into an isolated systemd slice">
+  <defs>
+    <style>
+      .sans { font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 1 1.5 L 8.5 5 L 1 8.5 z" fill="#78716c"/>
+    </marker>
+    <marker id="arrow-olive" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 1 1.5 L 8.5 5 L 1 8.5 z" fill="#4d7c0f"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect x="0" y="0" width="980" height="368" rx="14" fill="#fafaf9" stroke="#e7e5e4" stroke-width="1"/>
+
+  <!-- Column 1: Host Session -->
+  <text x="20" y="28" class="sans" font-size="11" font-weight="700" letter-spacing="0.08em" fill="#78716c">HOST SESSION</text>
+
+  <!-- Host Desktop Card -->
+  <rect x="20" y="40" width="222" height="84" rx="10" fill="#ffffff" stroke="#d6d3d1" stroke-width="1.25"/>
+  <text x="34" y="64" class="sans" font-size="13" font-weight="700" fill="#1c1917">Host Desktop</text>
+  <rect x="158" y="49" width="72" height="20" rx="10" fill="#ecfccb" stroke="#bef264" stroke-width="1"/>
+  <text x="194" y="62.5" text-anchor="middle" class="sans" font-size="10.5" font-weight="600" fill="#3f6212">Untouched</text>
+  <text x="34" y="86" class="mono" font-size="11" fill="#57534e">:0 / Wayland session</text>
+  <text x="34" y="106" class="sans" font-size="11.5" fill="#78716c">Never drawn on or focused</text>
+
+  <!-- Browser Profile Card -->
+  <rect x="20" y="140" width="222" height="92" rx="10" fill="#ffffff" stroke="#d6d3d1" stroke-width="1.25"/>
+  <text x="34" y="165" class="sans" font-size="13" font-weight="700" fill="#1c1917">Browser Profile</text>
+  <text x="34" y="187" class="mono" font-size="11" fill="#57534e">~/.config/&lt;browser&gt;</text>
+  <text x="34" y="207" class="sans" font-size="11.5" fill="#78716c">Read-only CoW source</text>
+  <text x="34" y="222" class="sans" font-size="11" fill="#78716c">Never written to by boxes</text>
+
+  <!-- Desktop Keyring Card -->
+  <rect x="20" y="248" width="222" height="96" rx="10" fill="#ffffff" stroke="#d6d3d1" stroke-width="1.25"/>
+  <text x="34" y="273" class="sans" font-size="13" font-weight="700" fill="#1c1917">Desktop Keyring</text>
+  <text x="34" y="295" class="mono" font-size="11" fill="#57534e">secret-tool search</text>
+  <text x="34" y="315" class="sans" font-size="11.5" fill="#78716c">Non-prompting v11 lookup</text>
+  <text x="34" y="331" class="sans" font-size="11" fill="#78716c">Read once, zeroed in RAM</text>
+
+  <!-- Connectors Host -> Clone -->
+  <path d="M 242 186 L 268 186" stroke="#78716c" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+  <path d="M 242 296 L 268 296" stroke="#78716c" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- Column 2: One-time Clone Bridge -->
+  <rect x="272" y="140" width="160" height="204" rx="10" fill="#fffbeb" stroke="#fcd34d" stroke-width="1.25"/>
+  <text x="286" y="165" class="mono" font-size="12.5" font-weight="700" fill="#92400e">agent-box up</text>
+  <text x="286" y="183" class="sans" font-size="11" font-weight="600" fill="#b45309">One-time clone (~2s)</text>
+  <line x1="286" y1="194" x2="418" y2="194" stroke="#fde68a" stroke-width="1"/>
+  <text x="286" y="214" class="mono" font-size="10.5" font-weight="600" fill="#78350f">FICLONE CoW copy</text>
+  <text x="286" y="232" class="sans" font-size="11" fill="#92400e">Skips cache, history,</text>
+  <text x="286" y="247" class="sans" font-size="11" fill="#92400e">passwords, extensions</text>
+  <text x="286" y="271" class="mono" font-size="10.5" font-weight="600" fill="#78350f">v11 -&gt; v10 cookies</text>
+  <text x="286" y="289" class="sans" font-size="11" fill="#92400e">Re-encrypted in RAM</text>
+  <text x="286" y="313" class="sans" font-size="11" font-weight="600" fill="#78350f">Zero keyring access</text>
+  <text x="286" y="328" class="sans" font-size="11" fill="#92400e">inside the box</text>
+
+  <!-- Connector Clone -> Slice -->
+  <path d="M 432 242 L 458 242" stroke="#4d7c0f" stroke-width="1.75" fill="none" marker-end="url(#arrow-olive)"/>
+
+  <!-- Column 3: Systemd User Slice -->
+  <rect x="464" y="16" width="496" height="336" rx="12" fill="#f7fee7" stroke="#84cc16" stroke-width="1.5"/>
+
+  <!-- Slice Header -->
+  <text x="480" y="42" class="mono" font-size="13.5" font-weight="700" fill="#365314">agent-box-box1.slice</text>
+  <rect x="752" y="25" width="192" height="22" rx="11" fill="#ecfccb" stroke="#bef264" stroke-width="1"/>
+  <text x="848" y="39.5" text-anchor="middle" class="mono" font-size="10" font-weight="600" fill="#3f6212">MemoryHigh=3G · TTL 12h</text>
+  <text x="480" y="61" class="mono" font-size="10.5" fill="#4d7c0f">env -i · ~/.cache/agent-box/box1 (0700) · ExecStopPost=__reap</text>
+
+  <!-- Row 1: Desktop Stack Cards -->
+  <!-- Card 1: Xvfb -->
+  <rect x="480" y="76" width="148" height="106" rx="9" fill="#ffffff" stroke="#d9f99d" stroke-width="1.25"/>
+  <text x="492" y="99" class="mono" font-size="12" font-weight="700" fill="#1c1917">Xvfb :100+</text>
+  <text x="492" y="119" class="mono" font-size="10.5" fill="#57534e">1440x900x24</text>
+  <text x="492" y="139" class="sans" font-size="11" fill="#57534e">MIT-MAGIC-COOKIE</text>
+  <text x="492" y="157" class="sans" font-size="11" fill="#78716c">Avoids Xwayland :0</text>
+  <text x="492" y="172" class="mono" font-size="10" fill="#78716c">-nolisten tcp</text>
+
+  <!-- Card 2: D-Bus + AT-SPI -->
+  <rect x="638" y="76" width="148" height="106" rx="9" fill="#ffffff" stroke="#d9f99d" stroke-width="1.25"/>
+  <text x="650" y="99" class="sans" font-size="12.5" font-weight="700" fill="#1c1917">D-Bus + AT-SPI</text>
+  <text x="650" y="119" class="sans" font-size="11" fill="#57534e">Private session bus</text>
+  <text x="650" y="139" class="sans" font-size="11" fill="#57534e">No service activation</text>
+  <text x="650" y="157" class="sans" font-size="11" fill="#78716c">No host portals or</text>
+  <text x="650" y="172" class="sans" font-size="11" fill="#78716c">keyring daemon</text>
+
+  <!-- Card 3: openbox -->
+  <rect x="796" y="76" width="148" height="106" rx="9" fill="#ffffff" stroke="#d9f99d" stroke-width="1.25"/>
+  <text x="808" y="99" class="mono" font-size="12" font-weight="700" fill="#1c1917">openbox</text>
+  <text x="808" y="119" class="sans" font-size="11" fill="#57534e">X11 window manager</text>
+  <text x="808" y="139" class="sans" font-size="11" fill="#57534e">Maximized windows</text>
+  <text x="808" y="157" class="sans" font-size="11" fill="#78716c">Private focus inside</text>
+  <text x="808" y="172" class="sans" font-size="11" fill="#78716c">the box only</text>
+
+  <!-- Row 2: Browser & Control Surfaces -->
+  <!-- Card 4: Browser + CDP -->
+  <rect x="480" y="194" width="148" height="106" rx="9" fill="#ffffff" stroke="#bae6fd" stroke-width="1.25"/>
+  <text x="492" y="217" class="sans" font-size="12.5" font-weight="700" fill="#0c4a6e">Browser + CDP</text>
+  <text x="492" y="237" class="mono" font-size="9" fill="#0369a1">--password-store=basic</text>
+  <text x="492" y="255" class="mono" font-size="10" fill="#57534e">--disable-sync</text>
+  <text x="492" y="274" class="mono" font-size="10" fill="#0369a1">127.0.0.1:&lt;port&gt;</text>
+  <text x="492" y="290" class="sans" font-size="10.5" fill="#78716c">agent-browser / PW</text>
+
+  <!-- Card 5: cua-driver -->
+  <rect x="638" y="194" width="148" height="106" rx="9" fill="#ffffff" stroke="#bae6fd" stroke-width="1.25"/>
+  <text x="650" y="217" class="mono" font-size="12" font-weight="700" fill="#0c4a6e">cua-driver</text>
+  <text x="650" y="237" class="sans" font-size="11" fill="#0369a1">Optional (--cua auto)</text>
+  <text x="650" y="256" class="sans" font-size="11" fill="#57534e">AX tree + GUI input</text>
+  <text x="650" y="274" class="mono" font-size="10" fill="#57534e">agent-box call</text>
+  <text x="650" y="290" class="mono" font-size="10" fill="#78716c">cua.sock</text>
+
+  <!-- Card 6: x11rb shot -->
+  <rect x="796" y="194" width="148" height="106" rx="9" fill="#ffffff" stroke="#bae6fd" stroke-width="1.25"/>
+  <text x="808" y="217" class="mono" font-size="12" font-weight="700" fill="#0c4a6e">x11rb shot</text>
+  <text x="808" y="237" class="sans" font-size="11" fill="#0369a1">Pure-Rust X11 PNG</text>
+  <text x="808" y="256" class="sans" font-size="11" fill="#57534e">Direct GetImage</text>
+  <text x="808" y="274" class="mono" font-size="10" fill="#57534e">agent-box shot</text>
+  <text x="808" y="290" class="sans" font-size="10.5" fill="#78716c">Zero external tools</text>
+
+  <!-- Footer Strip inside Slice -->
+  <rect x="480" y="312" width="464" height="28" rx="6" fill="#ecfccb" stroke="#bef264" stroke-width="1"/>
+  <text x="712" y="330" text-anchor="middle" class="sans" font-size="11" font-weight="600" fill="#365314">Native apps via agent-box run · Atomic slice cleanup on down, TTL, or crash</text>
+</svg>
