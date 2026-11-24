@@ -1,0 +1,167 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      AB: ${{ github.workspace }}/target/release/agent-box
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+
+      - name: Install runtime dependencies and native Google Chrome
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb openbox dbus dbus-user-session at-spi2-core libsecret-tools \
+            curl jq openssl python3
+          # Native .deb, not Ubuntu's snap.
+          curl -fsSLo "$RUNNER_TEMP/google-chrome-stable_current_amd64.deb" \
+            https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get install -y "$RUNNER_TEMP/google-chrome-stable_current_amd64.deb"
+          google-chrome-stable --version
+          # Ubuntu 24.04 blocks unprivileged user namespaces, which Chrome's sandbox needs.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Start a systemd user session
+        run: |
+          sudo loginctl enable-linger "$USER"
+          runtime_dir="/run/user/$(id -u)"
+          export XDG_RUNTIME_DIR="$runtime_dir"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=${runtime_dir}/bus"
+          for _ in $(seq 1 60); do
+            [ -S "${runtime_dir}/bus" ] && systemctl --user is-system-running >/dev/null 2>&1 && break
+            sleep 0.5
+          done
+          systemctl --user is-system-running || true
+          test -S "${runtime_dir}/bus"
+          {
+            echo "XDG_RUNTIME_DIR=${runtime_dir}"
+            echo "DBUS_SESSION_BUS_ADDRESS=unix:path=${runtime_dir}/bus"
+          } >> "$GITHUB_ENV"
+
+      - run: cargo build --release --locked
+
+      - name: doctor sees the native browser
+        run: |
+          # Chrome has not run yet, so give doctor the Local State it looks for.
+          mkdir -p "$HOME/.config/google-chrome/Default"
+          echo '{"profile":{"last_used":"Default"}}' > "$HOME/.config/google-chrome/Local State"
+          echo '{}' > "$HOME/.config/google-chrome/Default/Preferences"
+          "$AB" doctor | tee "$RUNNER_TEMP/doctor.txt"
+          grep -q '^ok   browser' "$RUNNER_TEMP/doctor.txt"
+
+      - name: Box without a browser takes a screenshot
+        run: |
+          "$AB" up box1 --no-browser --cua off
+          "$AB" shot box1 /tmp/box1.png
+          python3 -I - /tmp/box1.png <<'PY'
+          import struct, sys
+          d = open(sys.argv[1], "rb").read()
+          assert d[:8] == b"\x89PNG\r\n\x1a\n", "bad PNG magic"
+          assert d[12:16] == b"IHDR", "missing IHDR"
+          w, h = struct.unpack(">II", d[16:24])
+          assert w > 0 and h > 0, f"empty image {w}x{h}"
+          print(f"png ok {w}x{h}")
+          PY
+          "$AB" down box1
+          test -z "$(systemctl --user list-units --all --plain --no-legend 'agent-box-box1*')"
+          test ! -e "$HOME/.cache/agent-box/box1"
+
+      - name: Blank browser exposes CDP and a screenshot
+        run: |
+          "$AB" up box2 --blank --cua off --url about:blank
+          cdp="$("$AB" cdp box2)"
+          echo "cdp=$cdp"
+          [[ "$cdp" =~ ^http://127\.0\.0\.1:[0-9]+$ ]]
+          curl -fsS "$cdp/json/version" | jq -e '.Browser | test("Chrome")'
+          "$AB" shot box2 /tmp/box2.png
+          python3 -I - /tmp/box2.png <<'PY'
+          import struct, sys
+          d = open(sys.argv[1], "rb").read()
+          assert d[:8] == b"\x89PNG\r\n\x1a\n", "bad PNG magic"
+          w, h = struct.unpack(">II", d[16:24])
+          assert w > 0 and h > 0, f"empty image {w}x{h}"
+          print(f"png ok {w}x{h}")
+          PY
+          "$AB" down box2
+          test -z "$(systemctl --user list-units --all --plain --no-legend 'agent-box-box2*')"
+          test -z "$(ls -A "$HOME/.cache/agent-box/box2" 2>/dev/null)"
+
+      - name: Cookie clone from a fixture profile
+        run: |
+          fixture="$RUNNER_TEMP/fixture-profile"
+          python3 -I - "$fixture" <<'PY'
+          import hashlib, json, os, sqlite3, subprocess, sys
+          root = sys.argv[1]
+          os.makedirs(f"{root}/Default/Network")
+          json.dump({"profile": {"last_used": "Default"}}, open(f"{root}/Local State", "w"))
+          json.dump({"profile": {"exit_type": "Normal"}}, open(f"{root}/Default/Preferences", "w"))
+          # Chromium's fixed "basic" key and IV for v10 cookies.
+          key = hashlib.pbkdf2_hmac("sha1", b"peanuts", b"saltysalt", 1, 16).hex()
+          iv = (b" " * 16).hex()
+          host = ".example.com"
+          plain = hashlib.sha256(host.encode()).digest() + b"fixture-value"
+          enc = subprocess.run(
+              ["openssl", "enc", "-aes-128-cbc", "-K", key, "-iv", iv],
+              input=plain, capture_output=True, check=True).stdout
+          db = sqlite3.connect(f"{root}/Default/Network/Cookies")
+          db.executescript("""
+              CREATE TABLE meta(key LONGVARCHAR NOT NULL UNIQUE PRIMARY KEY, value LONGVARCHAR);
+              INSERT INTO meta VALUES('version','24');
+              CREATE TABLE cookies(host_key TEXT NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL DEFAULT '',
+                  encrypted_value BLOB NOT NULL DEFAULT x'', path TEXT NOT NULL DEFAULT '/');
+          """)
+          db.execute("INSERT INTO cookies(host_key,name,encrypted_value) VALUES(?,?,?)",
+                     (host, "fixture", b"v10" + enc))
+          db.commit()
+          db.close()
+          PY
+          "$AB" up box3 --from "$fixture" --cua off --url about:blank | tee "$RUNNER_TEMP/box3.json"
+          jq -e '.clone.files > 0' "$RUNNER_TEMP/box3.json"
+          curl -fsS "$("$AB" cdp box3)/json/version" >/dev/null
+          "$AB" down --all
+          "$AB" gc
+          test -z "$(systemctl --user list-units --all --plain --no-legend 'agent-box*')"
+          test -z "$(find "$HOME/.cache/agent-box" -mindepth 1 -not -name CACHEDIR.TAG 2>/dev/null)"
+
+      - name: Clean up boxes
+        if: always()
+        run: target/release/agent-box down --all || true

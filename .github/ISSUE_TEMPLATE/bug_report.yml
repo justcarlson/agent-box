@@ -1,0 +1,49 @@
+name: Bug report
+description: Something in agent-box broke or behaved unexpectedly
+labels: [bug]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands you ran, in order.
+      render: shell
+      placeholder: |
+        agent-box up box1 --from ~/.config/google-chrome
+        agent-box shot box1
+    validations:
+      required: true
+  - type: textarea
+    id: version
+    attributes:
+      label: Version and doctor output
+      description: Paste the output of `agent-box --version` and `agent-box doctor`.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Linux distro and browser
+      description: Distro, version and browser, including how it was installed (deb, flatpak, snap).
+      placeholder: Ubuntu 24.04, Google Chrome 140 (deb)
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Output of `ls $XDG_RUNTIME_DIR/agent-box-logs/` and the relevant log files,
+        or `journalctl --user -u 'agent-box-*' --no-pager | tail -n 200`.
+        Remove cookies, tokens and other secrets first.
+      render: shell
+    validations:
+      required: false
