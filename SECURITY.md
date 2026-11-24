@@ -27,7 +27,7 @@ Cloned cookies carry copies of your live session tokens. Signing out of a site o
 
 ## Browser Extensions
 
-Browser extensions and their storage (`Extensions`, `Local Extension Settings`, `Sync Extension Settings`, etc.) are skipped by default during profile cloning so password managers and extension state are not copied into boxes unless you explicitly pass `--with-extensions`.
+Extension code and extension storage (`Extensions`, `Local Extension Settings`, `Sync Extension Settings`, `Extension Cookies`, and per-extension `chrome-extension_*` stores under `IndexedDB`) are skipped by default unless you pass `--with-extensions`. Note that the shared `Local Storage` LevelDB can still contain entries written by `chrome-extension://` origins.
 
 ## Reporting a Vulnerability
 

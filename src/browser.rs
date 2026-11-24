@@ -129,14 +129,34 @@ fn line_invokes(line: &str, tool: &str, subcmd: &str) -> bool {
 }
 
 /// Detect whether `path` is a Snap or Flatpak browser (either by install path,
-/// symlink target, or a shell wrapper script invoking `snap run` / `flatpak run`).
+/// symlink hop target, canonical snap/flatpak binary, or a shell wrapper script
+/// invoking `snap run` / `flatpak run`).
 pub fn check_confinement(path: &Path) -> Option<Confinement> {
     if let Some(c) = path_confinement(path) {
         return Some(c);
     }
+    let mut cur = path.to_path_buf();
+    for _ in 0..40 {
+        let Ok(target) = fs::read_link(&cur) else {
+            break;
+        };
+        cur = if target.is_absolute() {
+            target
+        } else {
+            cur.parent().unwrap_or(Path::new("/")).join(target)
+        };
+        if let Some(c) = path_confinement(&cur) {
+            return Some(c);
+        }
+    }
     if let Ok(canon) = fs::canonicalize(path) {
         if let Some(c) = path_confinement(&canon) {
             return Some(c);
+        }
+        match canon.file_name().and_then(OsStr::to_str) {
+            Some("snap") => return Some(Confinement::Snap),
+            Some("flatpak") => return Some(Confinement::Flatpak),
+            _ => {}
         }
     }
     let mut f = fs::File::open(path).ok()?;
@@ -711,6 +731,23 @@ mod tests {
         assert_eq!(res.data_dir.as_deref(), Some(custom.as_path()));
         assert_eq!(res.keyring_apps, ALL_KEYRING_APPS);
 
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn symlink_chain_to_snap_binary_is_detected() {
+        let root = std::env::temp_dir().join(format!("agent-box-snap-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let snap_bin = root.join("usr/bin/snap");
+        make_exec(&snap_bin, "\x7fELFdummy");
+        let hop = root.join("snap/bin/chromium");
+        fs::create_dir_all(hop.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&snap_bin, &hop).unwrap();
+        let wrapper = root.join("home-bin/chromium");
+        fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&hop, &wrapper).unwrap();
+
+        assert_eq!(check_confinement(&wrapper), Some(Confinement::Snap));
         fs::remove_dir_all(&root).unwrap();
     }
 }

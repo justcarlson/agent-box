@@ -72,6 +72,8 @@ const SKIP_EXTENSIONS: &[&str] = &[
     "Extension State",
     "Extension Rules",
     "Extension Scripts",
+    "Extension Cookies",
+    "Extension Cookies-journal",
     "Managed Extension Settings",
     "Storage/ext",
 ];
@@ -116,8 +118,18 @@ fn plaintext_ok(plain: &[u8], host: &str, hashed: bool) -> bool {
 }
 
 fn should_skip(rel: &Path, with_extensions: bool) -> bool {
-    SKIP.iter().any(|s| Path::new(s) == rel)
-        || (!with_extensions && SKIP_EXTENSIONS.iter().any(|s| Path::new(s) == rel))
+    if SKIP.iter().any(|s| Path::new(s) == rel) {
+        return true;
+    }
+    if with_extensions {
+        return false;
+    }
+    if SKIP_EXTENSIONS.iter().any(|s| Path::new(s) == rel) {
+        return true;
+    }
+    rel.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("chrome-extension_"))
 }
 
 /// Clone `src_root/<profile>` (plus a trimmed `Local State`) into `dst_root`.
@@ -735,5 +747,11 @@ mod tests {
         let ext = Path::new("Storage").join("ext");
         assert!(should_skip(&ext, false));
         assert!(!should_skip(&ext, true));
+        let idb_ext = Path::new("IndexedDB").join("chrome-extension_abc_0.indexeddb.leveldb");
+        assert!(should_skip(&idb_ext, false));
+        assert!(!should_skip(&idb_ext, true));
+        let ext_cookies = Path::new("Extension Cookies");
+        assert!(should_skip(ext_cookies, false));
+        assert!(!should_skip(ext_cookies, true));
     }
 }

@@ -277,7 +277,9 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// Quote one argument for a systemd unit property such as `ExecStopPost=`.
+/// Quote one argument for a transient systemd unit property such as
+/// `ExecStopPost=`. Transient units do not expand `%` specifiers, but systemd
+/// does expand `$` environment variables at exec time.
 fn systemd_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -285,12 +287,34 @@ fn systemd_quote(s: &str) -> String {
         match ch {
             '\\' => out.push_str(r"\\"),
             '"' => out.push_str(r#"\""#),
-            '%' => out.push_str("%%"),
+            '$' => out.push_str("$$"),
             _ => out.push(ch),
         }
     }
     out.push('"');
     out
+}
+
+/// Validate `--mem` before claiming a box so typos fail fast instead of
+/// falling through to the cgroup delegation warning.
+fn validate_mem(s: &str) -> Result<()> {
+    if s == "infinity" {
+        return Ok(());
+    }
+    if let Some(pct) = s.strip_suffix('%') {
+        let val: f64 = pct.parse().with_context(|| {
+            format!("invalid --mem value {s:?}; expected e.g. 3G, 512M, 50%, or infinity")
+        })?;
+        if val.is_finite() && (0.0..=100.0).contains(&val) {
+            return Ok(());
+        }
+        bail!("invalid --mem percentage {s:?}; expected 0% to 100%");
+    }
+    let digits = s.strip_suffix(['K', 'M', 'G', 'T', 'B']).unwrap_or(s);
+    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Ok(());
+    }
+    bail!("invalid --mem value {s:?}; expected digits with optional K/M/G/T/B suffix, N%, or infinity")
 }
 
 /// A token unique to one creation of a box, so a late cleanup can tell a
@@ -539,6 +563,7 @@ fn self_env() -> Vec<String> {
 fn up(a: UpArgs) -> Result<()> {
     let t0 = Instant::now();
     let (w, h) = parse_size(&a.size)?;
+    validate_mem(&a.mem)?;
     let use_cua = resolve_cua(a.cua, paths::find_on_path("cua-driver").is_some())?;
     let resolved_browser = if a.no_browser && a.browser.is_none() {
         None
@@ -663,11 +688,18 @@ fn up(a: UpArgs) -> Result<()> {
         ])?;
         if !out.status.success() {
             eprintln!(
-                "agent-box: warning: could not set --mem {} on {} ({}); continuing without cgroup limits",
+                "agent-box: warning: could not set --mem {} on {} ({}); continuing without MemoryHigh",
                 a.mem,
                 b.slice(),
                 String::from_utf8_lossy(&out.stderr).trim()
             );
+            let _ = systemctl(&[
+                "set-property",
+                "--runtime",
+                &b.slice(),
+                "CPUWeight=50",
+                "IOWeight=50",
+            ]);
         }
         let display = ready_display(&b)?;
         let mut summary = json!({
@@ -1279,6 +1311,7 @@ fn detect_distro(os_release: &str) -> DistroFamily {
 
 fn distro_pkg(
     distro: DistroFamily,
+    fallback: &'static str,
     arch: &'static str,
     debian: &'static str,
     fedora: &'static str,
@@ -1287,7 +1320,7 @@ fn distro_pkg(
         DistroFamily::Arch => arch,
         DistroFamily::Debian => debian,
         DistroFamily::Fedora => fedora,
-        DistroFamily::Unknown => arch,
+        DistroFamily::Unknown => fallback,
     }
 }
 
@@ -1302,6 +1335,7 @@ fn install_hint(distro: DistroFamily, pkg: &str) -> String {
 
 fn doctor() -> Result<ExitCode> {
     let distro = fs::read_to_string("/etc/os-release")
+        .or_else(|_| fs::read_to_string("/usr/lib/os-release"))
         .map(|s| detect_distro(&s))
         .unwrap_or(DistroFamily::Unknown);
     let mut ok = true;
@@ -1327,7 +1361,7 @@ fn doctor() -> Result<ExitCode> {
         ("systemd-run", "systemd", "systemd", "systemd"),
         ("secret-tool", "libsecret", "libsecret-tools", "libsecret"),
     ] {
-        let pkg = distro_pkg(distro, arch_pkg, deb_pkg, fed_pkg);
+        let pkg = distro_pkg(distro, bin, arch_pkg, deb_pkg, fed_pkg);
         let found = paths::find_on_path(bin).is_some();
         if !found && !missing_pkgs.contains(&pkg) {
             missing_pkgs.push(pkg);
@@ -1342,7 +1376,7 @@ fn doctor() -> Result<ExitCode> {
     }
 
     for name in ["at-spi-bus-launcher", "at-spi2-registryd"] {
-        let pkg = distro_pkg(distro, "at-spi2-core", "at-spi2-core", "at-spi2-core");
+        let pkg = distro_pkg(distro, name, "at-spi2-core", "at-spi2-core", "at-spi2-core");
         match stack::find_atspi_binary(name) {
             Some(path) => println!("ok   {name}  ({})", path.display()),
             None => {
@@ -1450,15 +1484,29 @@ mod tests {
     }
 
     #[test]
-    fn systemd_quoting_handles_spaces_quotes_and_percent() {
+    fn systemd_quoting_handles_spaces_quotes_and_dollar() {
         assert_eq!(
             systemd_quote("/usr/bin/agent-box"),
             r#""/usr/bin/agent-box""#
         );
         assert_eq!(
             systemd_quote("/home/my user/100%/agent\"box"),
-            r#""/home/my user/100%%/agent\"box""#
+            r#""/home/my user/100%/agent\"box""#
         );
+        assert_eq!(
+            systemd_quote("/home/$USER/agent-box"),
+            r#""/home/$$USER/agent-box""#
+        );
+    }
+
+    #[test]
+    fn mem_validation_accepts_systemd_syntax_and_rejects_typos() {
+        for ok in ["3G", "512M", "1024K", "4096", "50%", "12.5%", "infinity"] {
+            assert!(validate_mem(ok).is_ok(), "{ok}");
+        }
+        for bad in ["3gb", "3g", "", "-1G", "105%", "abc"] {
+            assert!(validate_mem(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
