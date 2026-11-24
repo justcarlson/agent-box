@@ -10,10 +10,10 @@ For vulnerability disclosure, see [SECURITY.md](../SECURITY.md).
 | --- | --- | --- |
 | Display and input | Isolated | Private `Xvfb` on `:100+` with random `MIT-MAGIC-COOKIE-1` (`0600`). Boxed apps cannot draw on, read, or steal focus from your host desktop (`:0` / Wayland). |
 | Session D-Bus and AT-SPI | Isolated | Private `dbus-daemon` with no service activation directories, so portals, GVFS, and host daemons never auto-start inside a box. |
-| Desktop keyring | Isolated | Keyring secret is read once in `agent-box up` and zeroed in memory. The box has no access to your host session bus or keyring. |
+| Desktop keyring | Isolated | Raw `secret-tool` output is zeroed in memory; the secret stays only in the `agent-box up` process, and the box has no access to your host session bus or keyring. |
 | Host browser profile writes | Isolated | Copy-on-write clone (`FICLONE`, fallback regular copy) with symlinks skipped so boxed writes never mutate `~/.config/<browser>`. |
 | Cloud browser sync | Isolated | Boxed browsers launch with `--disable-sync`, preventing edits from syncing to cloud accounts. |
-| Saved passwords and extensions | Isolated by default | `Login Data`, `Web Data`, and browser extensions are skipped unless `--with-extensions` is passed. |
+| Saved passwords and extensions | Isolated by default | `Login Data` and `Web Data` are always skipped; extensions are skipped unless `--with-extensions` is passed. |
 | Linux UID and host filesystem | Shared | Boxed processes run as your UID. `HOME` is pointed at the box directory, but no mount or user namespace restricts direct reads of host paths. |
 | Network | Shared | Boxed processes share the host network namespace and routes. |
 | Loopback CDP port | Shared with local users | Chromium listens on `127.0.0.1:<ephemeral>` with no authentication. Any local user on the machine can reach loopback ports. |

@@ -36,12 +36,12 @@ agent-box down box1                                    # stop slice and delete a
 
 | Approach | Ready time | Memory | Signed in as you | Native Linux apps | Tradeoff |
 | --- | --- | --- | --- | --- | --- |
-| **`agent-box`** | ~0.3-2s | ~210-520 MB | Yes (CoW clone) | Yes (X11 + AT-SPI) | Linux + systemd only; same UID |
+| **`agent-box`** | ~0.3-2s | ~210-700 MB | Yes (CoW clone) | Yes (X11 + AT-SPI) | Linux + systemd only; same UID |
 | Shared host desktop | Instant | 0 extra | Yes | Yes | Steals focus, cursor, and clipboard |
 | Docker desktops / VMs | 10-60s | 1-4 GB | No (manual login) | Inside container/VM | Heavy images, re-auth friction |
 | Hosted browser clouds | 2-10s | Remote | No (manual/synced) | No | Monthly cost, remote latency |
 
-`agent-box` clones your browser profile with Linux `FICLONE` copy-on-write (skipping caches, history, saved passwords, and extensions by default) so disk overhead stays tiny. It reads your unlocked keyring secret once in memory, re-encrypts `v11` cookies to Chromium's basic `v10` key, and zeroes the secret so the boxed browser needs zero keyring access.
+`agent-box` clones your browser profile with Linux `FICLONE` copy-on-write (skipping caches, history, saved passwords, and extensions by default) so disk overhead stays tiny. It reads your unlocked keyring secret once in the `up` process, re-encrypts `v11` cookies to Chromium's basic `v10` key, and zeroes the raw `secret-tool` output buffer so the boxed browser needs zero keyring access.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.svg">
@@ -71,7 +71,7 @@ Download a static musl binary from [GitHub Releases](https://github.com/justcarl
 ```bash
 cargo install --locked --git https://github.com/justcarlson/agent-box --tag v0.1.0
 # or with cargo-binstall:
-cargo binstall agent-box
+cargo binstall --git https://github.com/justcarlson/agent-box agent-box
 ```
 
 Then run `agent-box doctor` to check host dependencies; it prints the exact `pacman`, `apt`, or `dnf` command for anything missing. On Arch, use a GitHub Release binary or `cargo install` (`aur/agent-box` is an unrelated Podman tool).
@@ -89,7 +89,7 @@ Then run `agent-box doctor` to check host dependencies; it prints the exact `pac
 | `agent-box ls [--json]` | List active and stopped boxes with display, memory, and CDP URL |
 | `agent-box env NAME` | Print reversible `export` lines for targeting a box from a shell |
 | `agent-box gc` | Remove stopped boxes and cached profile files after a crash or reboot |
-| `agent-box down NAME... \| --all` | Stop boxes atomically and delete their files |
+| `agent-box down NAME... \| --all` | Stop boxes and delete their files |
 | `agent-box doctor` | Verify host dependencies, native browser, profile, and systemd user session |
 
 ## Isolation boundary

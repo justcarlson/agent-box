@@ -48,7 +48,7 @@ agent-box open box1 https://example.com
 
 ```bash
 agent-box call box1 list_windows
-agent-box call box1 get_window_state '{"window_title":"Calculator"}'
+agent-box call box1 get_window_state '{"pid":1234,"window_id":2}' --shot /tmp/w.png
 agent-box call box1 click '{"x":120,"y":240}'
 ```
 

@@ -38,7 +38,7 @@
   <text x="34" y="273" class="sans" font-size="13" font-weight="700" fill="#1c1917">Desktop Keyring</text>
   <text x="34" y="295" class="mono" font-size="11" fill="#57534e">secret-tool search</text>
   <text x="34" y="315" class="sans" font-size="11.5" fill="#78716c">Non-prompting v11 lookup</text>
-  <text x="34" y="331" class="sans" font-size="11" fill="#78716c">Read once, zeroed in RAM</text>
+  <text x="34" y="331" class="sans" font-size="11" fill="#78716c">Stays in agent-box up only</text>
 
   <!-- Connectors Host -> Clone -->
   <path d="M 242 186 L 268 186" stroke="#78716c" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
@@ -121,5 +121,5 @@
 
   <!-- Footer Strip inside Slice -->
   <rect x="480" y="312" width="464" height="28" rx="6" fill="#ecfccb" stroke="#bef264" stroke-width="1"/>
-  <text x="712" y="330" text-anchor="middle" class="sans" font-size="11" font-weight="600" fill="#365314">Native apps via agent-box run · Atomic slice cleanup on down, TTL, or crash</text>
+  <text x="712" y="330" text-anchor="middle" class="sans" font-size="11" font-weight="600" fill="#365314">Native apps via agent-box run · Slice cleanup on down, TTL, or crash</text>
 </svg>
