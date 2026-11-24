@@ -1,18 +1,33 @@
-//! The per-box desktop: Xvfb, a private D-Bus with AT-SPI, openbox and a
-//! cua-driver daemon. Runs as the main process of the box's systemd unit,
-//! so stopping the unit's slice ends every process in the box.
+//! The per-box desktop: Xvfb, a private D-Bus with AT-SPI, openbox and
+//! optionally a cua-driver daemon. Runs as the main process of the box's
+//! systemd unit, so stopping the unit's slice ends every process in the box.
 
-use crate::paths::Box;
+use crate::paths::AgentBox;
 use anyhow::{bail, Context, Result};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
+
+/// Candidate directories for AT-SPI helper binaries across Linux distros
+/// (Arch, Fedora/RHEL, Debian/Ubuntu).
+pub const ATSPI_DIRS: &[&str] = &["/usr/lib", "/usr/libexec", "/usr/lib/at-spi2-core"];
+
+pub fn find_atspi_binary(name: &str) -> Option<PathBuf> {
+    find_atspi_in(name, ATSPI_DIRS)
+}
+
+pub(crate) fn find_atspi_in(name: &str, dirs: &[&str]) -> Option<PathBuf> {
+    dirs.iter()
+        .map(|d| Path::new(d).join(name))
+        .find(|p| p.is_file())
+}
 
 /// A session bus that only routes messages. No activation directories, so
 /// nothing (portals, gvfs, keyring) starts in the box behind our back.
@@ -43,7 +58,7 @@ fn wait_for(what: &str, timeout: Duration, mut ok: impl FnMut() -> bool) -> Resu
 
 /// One MIT-MAGIC-COOKIE-1 entry with FamilyWild and no display number, so it
 /// matches whichever display Xvfb picks.
-fn write_xauth(path: &Path) -> Result<()> {
+pub(crate) fn write_xauth(path: &Path) -> Result<()> {
     let mut cookie = [0u8; 16];
     fs::File::open("/dev/urandom")?.read_exact(&mut cookie)?;
     let mut buf = Vec::new();
@@ -66,13 +81,13 @@ fn write_xauth(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn log_file(b: &Box, name: &str) -> Result<Stdio> {
+fn log_file(b: &AgentBox, name: &str) -> Result<Stdio> {
     let dir = b.dir.join("logs");
     fs::create_dir_all(&dir)?;
     Ok(fs::File::create(dir.join(format!("{name}.log")))?.into())
 }
 
-fn spawn(b: &Box, name: &str, cmd: &mut Command) -> Result<Child> {
+fn spawn(b: &AgentBox, name: &str, cmd: &mut Command) -> Result<Child> {
     cmd.stdin(Stdio::null())
         .stdout(log_file(b, name)?)
         .stderr(log_file(b, &format!("{name}.err"))?)
@@ -101,14 +116,16 @@ fn display_taken(n: u32, unix_table: &str) -> bool {
     Path::new(&format!("/tmp/.X{n}-lock")).exists()
         || Path::new(&sock).exists()
         || unix_table.lines().any(|l| {
-            l.split_whitespace().last().is_some_and(|p| p.trim_start_matches('@') == sock || p == format!("{sock}_"))
+            l.split_whitespace()
+                .last()
+                .is_some_and(|p| p.trim_start_matches('@') == sock || p == format!("{sock}_"))
         })
 }
 
 /// Start Xvfb on the first free display at or above FIRST_DISPLAY. Xvfb
 /// writes the number to fd 3 once it accepts clients; if it exits first
 /// (another box won the race for that number), try the next one.
-fn start_xvfb(b: &Box, width: u32, height: u32) -> Result<(Child, u32)> {
+fn start_xvfb(b: &AgentBox, width: u32, height: u32) -> Result<(Child, u32)> {
     let unix_table = fs::read_to_string("/proc/net/unix").unwrap_or_default();
     for n in FIRST_DISPLAY..FIRST_DISPLAY + 400 {
         if display_taken(n, &unix_table) {
@@ -126,7 +143,13 @@ fn start_xvfb(b: &Box, width: u32, height: u32) -> Result<(Child, u32)> {
             .args(["-displayfd", "3", "-nolisten", "tcp"])
             .arg("-auth")
             .arg(b.xauth())
-            .args(["-screen", "0", &format!("{width}x{height}x24"), "-dpi", "96"]);
+            .args([
+                "-screen",
+                "0",
+                &format!("{width}x{height}x24"),
+                "-dpi",
+                "96",
+            ]);
         // SAFETY: only async-signal-safe dup2 between fork and exec.
         unsafe {
             xvfb.pre_exec(move || {
@@ -146,10 +169,13 @@ fn start_xvfb(b: &Box, width: u32, height: u32) -> Result<(Child, u32)> {
         let _ = child.kill();
         let _ = child.wait();
     }
-    bail!("no free X display between :{FIRST_DISPLAY} and :{}", FIRST_DISPLAY + 400)
+    bail!(
+        "no free X display between :{FIRST_DISPLAY} and :{}",
+        FIRST_DISPLAY + 400
+    )
 }
 
-pub fn run(b: &Box, width: u32, height: u32) -> Result<()> {
+pub fn run(b: &AgentBox, width: u32, height: u32, with_cua: bool) -> Result<()> {
     fs::create_dir_all(&b.run)?;
     fs::create_dir_all(b.home())?;
     let _ = fs::remove_file(b.ready_file());
@@ -160,7 +186,7 @@ pub fn run(b: &Box, width: u32, height: u32) -> Result<()> {
     children.push(("xvfb", xvfb));
 
     let env = b.app_env(display);
-    let cmd = |prog: &str| {
+    let cmd = |prog: &OsStr| {
         let mut c = Command::new(prog);
         c.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
         c
@@ -168,22 +194,49 @@ pub fn run(b: &Box, width: u32, height: u32) -> Result<()> {
 
     // Private session bus.
     let bus_conf = b.run.join("bus.conf");
-    fs::write(&bus_conf, BUS_CONFIG.replace("@BUS@", &b.bus().display().to_string()))?;
+    fs::write(
+        &bus_conf,
+        BUS_CONFIG.replace("@BUS@", &b.bus().display().to_string()),
+    )?;
     let _ = fs::remove_file(b.bus());
     children.push((
         "dbus",
-        spawn(b, "dbus", cmd("dbus-daemon").arg("--nofork").arg(format!("--config-file={}", bus_conf.display())))?,
+        spawn(
+            b,
+            "dbus",
+            cmd(OsStr::new("dbus-daemon"))
+                .arg("--nofork")
+                .arg(format!("--config-file={}", bus_conf.display())),
+        )?,
     ));
     wait_for("D-Bus", Duration::from_secs(5), || b.bus().exists())?;
     let bus = format!("unix:path={}", b.bus().display());
 
     // Accessibility bus, switched on, plus its registry.
+    let atspi_launcher = find_atspi_binary("at-spi-bus-launcher").context(
+        "at-spi-bus-launcher not found in /usr/lib, /usr/libexec, or /usr/lib/at-spi2-core",
+    )?;
+    let atspi_registryd = find_atspi_binary("at-spi2-registryd").context(
+        "at-spi2-registryd not found in /usr/lib, /usr/libexec, or /usr/lib/at-spi2-core",
+    )?;
     children.push((
         "atspi",
-        spawn(b, "atspi", cmd("/usr/lib/at-spi-bus-launcher").arg("--launch-immediately"))?,
+        spawn(
+            b,
+            "atspi",
+            cmd(atspi_launcher.as_os_str()).arg("--launch-immediately"),
+        )?,
     ));
     wait_for("AT-SPI bus", Duration::from_secs(5), || {
-        dbus_send(&bus, &["--print-reply", "--dest=org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus.GetAddress"])
+        dbus_send(
+            &bus,
+            &[
+                "--print-reply",
+                "--dest=org.a11y.Bus",
+                "/org/a11y/bus",
+                "org.a11y.Bus.GetAddress",
+            ],
+        )
     })?;
     dbus_send(
         &bus,
@@ -197,21 +250,31 @@ pub fn run(b: &Box, width: u32, height: u32) -> Result<()> {
             "variant:boolean:true",
         ],
     );
-    children.push(("registryd", spawn(b, "registryd", &mut cmd("/usr/lib/at-spi2-registryd"))?));
-    children.push(("openbox", spawn(b, "openbox", &mut cmd("openbox"))?));
+    children.push((
+        "registryd",
+        spawn(b, "registryd", &mut cmd(atspi_registryd.as_os_str()))?,
+    ));
+    children.push((
+        "openbox",
+        spawn(b, "openbox", &mut cmd(OsStr::new("openbox")))?,
+    ));
 
-    // cua-driver reads its settings (telemetry choice, history) from the real HOME.
-    let _ = fs::remove_file(b.cua_socket());
-    let mut cua = cmd("cua-driver");
-    cua.env("HOME", crate::paths::home())
-        .arg("serve")
-        .arg("--socket")
-        .arg(b.cua_socket())
-        .arg("--pid-file")
-        .arg(b.run.join("cua.pid"))
-        .arg("--no-overlay");
-    children.push(("cua-driver", spawn(b, "cua-driver", &mut cua)?));
-    wait_for("cua-driver socket", Duration::from_secs(10), || b.cua_socket().exists())?;
+    if with_cua {
+        // cua-driver reads its settings (telemetry choice, history) from the real HOME.
+        let _ = fs::remove_file(b.cua_socket());
+        let mut cua = cmd(OsStr::new("cua-driver"));
+        cua.env("HOME", crate::paths::home())
+            .arg("serve")
+            .arg("--socket")
+            .arg(b.cua_socket())
+            .arg("--pid-file")
+            .arg(b.run.join("cua.pid"))
+            .arg("--no-overlay");
+        children.push(("cua-driver", spawn(b, "cua-driver", &mut cua)?));
+        wait_for("cua-driver socket", Duration::from_secs(10), || {
+            b.cua_socket().exists()
+        })?;
+    }
 
     fs::write(b.ready_file(), format!("{display}\n"))?;
 
@@ -241,5 +304,36 @@ mod tests {
         assert!(display_taken(101, table));
         assert!(display_taken(102, table));
         assert!(!display_taken(103, table));
+    }
+
+    #[test]
+    fn finds_atspi_across_candidate_dirs() {
+        let root = std::env::temp_dir().join(format!("agent-box-atspi-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let d1 = root.join("lib");
+        let d2 = root.join("libexec");
+        let d3 = root.join("lib/at-spi2-core");
+        fs::create_dir_all(&d1).unwrap();
+        fs::create_dir_all(&d2).unwrap();
+        fs::create_dir_all(&d3).unwrap();
+        fs::write(d3.join("at-spi-bus-launcher"), "").unwrap();
+        fs::write(d2.join("at-spi2-registryd"), "").unwrap();
+
+        let s1 = d1.to_string_lossy().into_owned();
+        let s2 = d2.to_string_lossy().into_owned();
+        let s3 = d3.to_string_lossy().into_owned();
+        let dirs = [s1.as_str(), s2.as_str(), s3.as_str()];
+
+        assert_eq!(
+            find_atspi_in("at-spi-bus-launcher", &dirs),
+            Some(d3.join("at-spi-bus-launcher"))
+        );
+        assert_eq!(
+            find_atspi_in("at-spi2-registryd", &dirs),
+            Some(d2.join("at-spi2-registryd"))
+        );
+        assert_eq!(find_atspi_in("missing", &dirs), None);
+
+        fs::remove_dir_all(&root).unwrap();
     }
 }

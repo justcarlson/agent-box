@@ -1,30 +1,47 @@
 //! agent-box: parallel, disposable desktops for computer-use agents.
 //!
 //! Each box is a private X display with its own D-Bus, accessibility bus,
-//! window manager and cua-driver daemon, in its own systemd slice. Its
+//! window manager and optional cua-driver daemon, in its own systemd slice. Its
 //! browser starts from a copy-on-write clone of the user's main profile, so
 //! it is signed in wherever the user is. Nothing a box does reaches the
 //! user's desktop or writes back to the user's profile.
 
+mod browser;
 mod paths;
 mod profile;
+mod screenshot;
 mod stack;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
-use paths::Box;
+use clap::{Parser, Subcommand, ValueEnum};
+use paths::AgentBox;
+use profile::CloneOptions;
 use serde_json::{json, Map, Value};
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CuaMode {
+    /// Start cua-driver if it is available on PATH.
+    Auto,
+    /// Require cua-driver on PATH and fail if missing.
+    On,
+    /// Do not start cua-driver (CDP and screenshots still work).
+    Off,
+}
+
 #[derive(Parser)]
-#[command(name = "agent-box", version, about = "Parallel, disposable computer-use desktops signed in like your main browser")]
+#[command(
+    name = "agent-box",
+    version,
+    about = "Parallel, disposable computer-use desktops signed in like your main browser"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -63,6 +80,12 @@ enum Cmd {
         /// Stop the box after this long, in case nobody runs `down`.
         #[arg(long, default_value = "12h")]
         ttl: String,
+        /// Whether to start cua-driver for GUI accessibility calls.
+        #[arg(long, value_enum, default_value_t = CuaMode::Auto)]
+        cua: CuaMode,
+        /// Copy browser extensions into the cloned profile (skipped by default).
+        #[arg(long)]
+        with_extensions: bool,
     },
     /// Stop boxes and delete their files.
     Down {
@@ -75,6 +98,8 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Remove stopped boxes and their cached profile files.
+    Gc,
     /// Call a cua-driver tool in a box. Adds "session":NAME, and foreground
     /// delivery for pixel input, when the JSON does not set them.
     Call {
@@ -113,6 +138,8 @@ enum Cmd {
         name: String,
         #[arg(long)]
         size: String,
+        #[arg(long)]
+        cua: bool,
     },
 }
 
@@ -146,12 +173,43 @@ fn real_main() -> Result<ExitCode> {
     // Before any thread starts, so changing the environment is safe.
     restore_host_env();
     match Cli::parse().cmd {
-        Cmd::Up { name, url, no_browser, blank, from, profile, size, mem, browser, ttl } => {
-            up(UpArgs { name, url, no_browser, blank, from, profile, size, mem, browser, ttl })?
-        }
+        Cmd::Up {
+            name,
+            url,
+            no_browser,
+            blank,
+            from,
+            profile,
+            size,
+            mem,
+            browser,
+            ttl,
+            cua,
+            with_extensions,
+        } => up(UpArgs {
+            name,
+            url,
+            no_browser,
+            blank,
+            from,
+            profile,
+            size,
+            mem,
+            browser,
+            ttl,
+            cua,
+            with_extensions,
+        })?,
         Cmd::Down { names, all } => down(names, all)?,
         Cmd::Ls { json } => ls(json)?,
-        Cmd::Call { name, tool, json, shot, timeout } => return call(&name, &tool, json, shot, timeout),
+        Cmd::Gc => gc()?,
+        Cmd::Call {
+            name,
+            tool,
+            json,
+            shot,
+            timeout,
+        } => return call(&name, &tool, json, shot, timeout),
         Cmd::Run { name, cmd } => {
             let b = existing(&name)?;
             let unit = start_app(&b, "app", &cmd)?;
@@ -175,10 +233,10 @@ fn real_main() -> Result<ExitCode> {
             }
         }
         Cmd::Doctor => return doctor(),
-        Cmd::Reap { name } => reap_stopped(&Box::new(&name)?)?,
-        Cmd::Stack { name, size } => {
+        Cmd::Reap { name } => reap_stopped(&AgentBox::new(&name)?)?,
+        Cmd::Stack { name, size, cua } => {
             let (w, h) = parse_size(&size)?;
-            stack::run(&Box::new(&name)?, w, h)?;
+            stack::run(&AgentBox::new(&name)?, w, h, cua)?;
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -195,6 +253,19 @@ struct UpArgs {
     mem: String,
     browser: Option<PathBuf>,
     ttl: String,
+    cua: CuaMode,
+    with_extensions: bool,
+}
+
+fn resolve_cua(mode: CuaMode, has_cua: bool) -> Result<bool> {
+    match mode {
+        CuaMode::Off => Ok(false),
+        CuaMode::Auto => Ok(has_cua),
+        CuaMode::On if has_cua => Ok(true),
+        CuaMode::On => {
+            bail!("--cua on requires `cua-driver` on PATH; install cua-driver or pass --cua off")
+        }
+    }
 }
 
 fn parse_size(s: &str) -> Result<(u32, u32)> {
@@ -206,13 +277,36 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// Quote one argument for a systemd unit property such as `ExecStopPost=`.
+fn systemd_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str(r"\\"),
+            '"' => out.push_str(r#"\""#),
+            '%' => out.push_str("%%"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// A token unique to one creation of a box, so a late cleanup can tell a
 /// replacement box of the same name from its own.
 fn generation() -> String {
-    format!("{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos())
+    format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    )
 }
 
-fn read_gen(b: &Box) -> Option<String> {
+fn read_gen(b: &AgentBox) -> Option<String> {
     fs::read_to_string(b.dir.join("gen")).ok()
 }
 
@@ -232,39 +326,49 @@ fn check_interrupt() -> Result<()> {
 }
 
 fn now_ms() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
-fn existing(name: &str) -> Result<Box> {
-    let b = Box::new(name)?;
+fn existing(name: &str) -> Result<AgentBox> {
+    let b = AgentBox::new(name)?;
     if !b.dir.is_dir() {
         bail!("no box named {name}; see `agent-box ls`");
     }
     Ok(b)
 }
 
-fn ready_display(b: &Box) -> Result<u32> {
+fn ready_display(b: &AgentBox) -> Result<u32> {
     b.display()
         .filter(|_| unit_state(&b.unit()).as_deref() == Some("active"))
-        .with_context(|| format!("box {} is not running; see `agent-box ls` and {}/logs", b.name, b.dir.display()))
+        .with_context(|| {
+            format!(
+                "box {} is not running; see `agent-box ls` and {}/logs",
+                b.name,
+                b.dir.display()
+            )
+        })
 }
 
 /// Claim a box name atomically, so parallel `up` calls never share one.
 /// The name lock is taken before the box directory exists and is held until
 /// `up` ends, so no cleanup deletes a box that is still being created.
-fn claim(name: Option<String>) -> Result<(Box, fs::File)> {
-    let (state, _) = paths::roots();
-    fs::create_dir_all(&state)?;
-    // Boxes hold cookie copies: owner only.
-    fs::set_permissions(&state, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
-    let try_claim = |n: &str| -> Result<Option<(Box, fs::File)>> {
-        let b = Box::new(n)?;
+fn claim(name: Option<String>) -> Result<(AgentBox, fs::File)> {
+    let state = paths::ensure_state_root()?;
+    let try_claim = |n: &str| -> Result<Option<(AgentBox, fs::File)>> {
+        let b = AgentBox::new(n)?;
         if b.dir.exists() {
             return Ok(None);
         }
-        let Some(lock) = lock_name(&b, Duration::ZERO)? else { return Ok(None) };
+        let Some(lock) = lock_name(&b, Duration::ZERO)? else {
+            return Ok(None);
+        };
         // An earlier box of this name may still be stopping.
-        if !is_stopped(unit_state(&b.unit()).as_deref()) || !is_stopped(unit_state(&b.slice()).as_deref()) {
+        if !is_stopped(unit_state(&b.unit()).as_deref())
+            || !is_stopped(unit_state(&b.slice()).as_deref())
+        {
             return Ok(None);
         }
         match fs::create_dir(&b.dir) {
@@ -277,17 +381,25 @@ fn claim(name: Option<String>) -> Result<(Box, fs::File)> {
         }
     };
     match name {
-        Some(n) => try_claim(&n)?
-            .with_context(|| format!("box {n} already exists or is still stopping; see `agent-box ls`")),
+        Some(n) => try_claim(&n)?.with_context(|| {
+            format!("box {n} already exists or is still stopping; see `agent-box ls`")
+        }),
         None => {
             // Never hand out an auto-name used before (its lock file stays),
             // so an agent's old name cannot point to another agent's box.
             // Creating the lock file with O_EXCL reserves the name atomically.
             let locks = state.join(".locks");
-            fs::DirBuilder::new().recursive(true).mode(0o700).create(&locks)?;
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&locks)?;
             for i in 1u32.. {
                 let n = format!("box{i}");
-                match fs::OpenOptions::new().write(true).create_new(true).open(locks.join(&n)) {
+                match fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(locks.join(&n))
+                {
                     Ok(_) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                     Err(e) => return Err(e.into()),
@@ -305,10 +417,13 @@ fn claim(name: Option<String>) -> Result<(Box, fs::File)> {
 /// process holds it. The lock file lives outside the box directory, so it
 /// outlives the box. Whoever holds the lock owns the box's files: `up` while
 /// it creates them, and a cleanup while it deletes them.
-fn lock_name(b: &Box, wait: Duration) -> Result<Option<fs::File>> {
+fn lock_name(b: &AgentBox, wait: Duration) -> Result<Option<fs::File>> {
     use std::os::unix::io::AsRawFd;
     let dir = paths::roots().0.join(".locks");
-    fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)?;
     let path = dir.join(&b.name);
     let f = fs::OpenOptions::new()
         .write(true)
@@ -331,7 +446,11 @@ fn lock_name(b: &Box, wait: Duration) -> Result<Option<fs::File>> {
 
 fn systemctl(args: &[&str]) -> Result<std::process::Output> {
     // Own process group, so a second Ctrl-C cannot kill a cleanup `stop`.
-    Ok(Command::new("systemctl").arg("--user").args(args).process_group(0).output()?)
+    Ok(Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .process_group(0)
+        .output()?)
 }
 
 /// `systemctl is-active` output, or `None` when the user manager gave no
@@ -343,7 +462,16 @@ fn unit_state(unit: &str) -> Option<String> {
 
 fn parse_state(out: &str) -> Option<String> {
     let s = out.trim();
-    const KNOWN: &[&str] = &["active", "reloading", "inactive", "failed", "activating", "deactivating", "maintenance", "refreshing"];
+    const KNOWN: &[&str] = &[
+        "active",
+        "reloading",
+        "inactive",
+        "failed",
+        "activating",
+        "deactivating",
+        "maintenance",
+        "refreshing",
+    ];
     KNOWN.contains(&s).then(|| s.to_string())
 }
 
@@ -353,14 +481,23 @@ fn is_stopped(state: Option<&str>) -> bool {
 
 fn user_manager_ok() -> bool {
     systemctl(&["is-system-running"]).is_ok_and(|o| {
-        matches!(String::from_utf8_lossy(&o.stdout).trim(), "running" | "degraded" | "starting" | "initializing")
+        matches!(
+            String::from_utf8_lossy(&o.stdout).trim(),
+            "running" | "degraded" | "starting" | "initializing"
+        )
     })
 }
 
 /// Box names from state directories and from any leftover slices.
 fn all_boxes() -> Vec<String> {
     let mut names = paths::all_names();
-    if let Ok(o) = systemctl(&["list-units", "--all", "--plain", "--no-legend", "agent-box-*.slice"]) {
+    if let Ok(o) = systemctl(&[
+        "list-units",
+        "--all",
+        "--plain",
+        "--no-legend",
+        "agent-box-*.slice",
+    ]) {
         names.extend(slice_names(&String::from_utf8_lossy(&o.stdout)));
     }
     names.sort();
@@ -370,7 +507,13 @@ fn all_boxes() -> Vec<String> {
 
 fn slice_names(out: &str) -> Vec<String> {
     out.lines()
-        .filter_map(|l| l.split_whitespace().next()?.strip_prefix("agent-box-")?.strip_suffix(".slice").map(String::from))
+        .filter_map(|l| {
+            l.split_whitespace()
+                .next()?
+                .strip_prefix("agent-box-")?
+                .strip_suffix(".slice")
+                .map(String::from)
+        })
         .filter(|n| paths::check_name(n).is_ok())
         .collect()
 }
@@ -378,29 +521,46 @@ fn slice_names(out: &str) -> Vec<String> {
 /// Environment that `agent-box` itself needs to find the box's paths when
 /// systemd starts it with an otherwise empty environment.
 fn self_env() -> Vec<String> {
-    ["HOME", "PATH", "XDG_RUNTIME_DIR", "XDG_CACHE_HOME", "USER", "LOGNAME", "LANG", "TZ"]
-        .iter()
-        .filter_map(|k| std::env::var(k).ok().map(|v| format!("{k}={v}")))
-        .collect()
+    [
+        "HOME",
+        "PATH",
+        "XDG_RUNTIME_DIR",
+        "XDG_CACHE_HOME",
+        "USER",
+        "LOGNAME",
+        "LANG",
+        "TZ",
+    ]
+    .iter()
+    .filter_map(|k| std::env::var(k).ok().map(|v| format!("{k}={v}")))
+    .collect()
 }
 
 fn up(a: UpArgs) -> Result<()> {
     let t0 = Instant::now();
     let (w, h) = parse_size(&a.size)?;
-    let browser = match &a.browser {
-        Some(p) => Some(p.clone()),
-        None if a.no_browser => None,
-        None => Some(default_browser().context("no browser found; pass --browser or --no-browser")?),
+    let use_cua = resolve_cua(a.cua, paths::find_on_path("cua-driver").is_some())?;
+    let resolved_browser = if a.no_browser && a.browser.is_none() {
+        None
+    } else {
+        Some(browser::resolve(
+            a.browser.as_deref(),
+            a.from.as_deref(),
+            a.blank,
+        )?)
     };
     if !user_manager_ok() {
         bail!("cannot reach the systemd user manager (systemctl --user)");
     }
-    reap_dead();
+    for n in reap_dead() {
+        eprintln!("agent-box: removed stopped box {n}");
+    }
     for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
         // SAFETY: the handler only stores to an atomic. A signal the caller
         // ignores (nohup, `&`) stays ignored.
         unsafe {
-            if libc::signal(sig, note_up_signal as *const () as libc::sighandler_t) == libc::SIG_IGN {
+            if libc::signal(sig, note_up_signal as *const () as libc::sighandler_t) == libc::SIG_IGN
+            {
                 libc::signal(sig, libc::SIG_IGN);
             }
         }
@@ -411,20 +571,33 @@ fn up(a: UpArgs) -> Result<()> {
         let mut meta = Map::new();
         meta.insert("name".into(), json!(b.name));
         meta.insert("created_ms".into(), json!(now_ms()));
-        if let Some(browser) = &browser {
-            meta.insert("browser".into(), json!(browser));
+        meta.insert("cua".into(), json!(use_cua));
+        if let Some(br) = &resolved_browser {
+            meta.insert("browser".into(), json!(br.binary));
+            if let Some(kind) = br.kind {
+                meta.insert("browser_kind".into(), json!(kind));
+            }
             if a.blank {
                 meta.insert("profile".into(), json!("blank"));
             } else {
-                let src = a.from.clone().unwrap_or_else(profile::default_source);
+                let src = br.data_dir.as_ref().context(
+                    "could not determine browser profile directory; pass --from or --blank",
+                )?;
                 let prof = match &a.profile {
                     Some(p) => p.clone(),
-                    None => last_used_profile(&src),
+                    None => last_used_profile(src),
                 };
                 let tc = Instant::now();
-                let r = profile::clone_profile(&src, &prof, &b.browser_dir())?;
+                let opts = CloneOptions {
+                    keyring_apps: br.keyring_apps,
+                    with_extensions: a.with_extensions,
+                };
+                let r = profile::clone_profile(src, &prof, &b.browser_dir(), &opts)?;
                 check_interrupt()?;
-                meta.insert("profile".into(), json!(format!("{}/{}", src.display(), prof)));
+                meta.insert(
+                    "profile".into(),
+                    json!(format!("{}/{}", src.display(), prof)),
+                );
                 meta.insert("profile_dir".into(), json!(prof));
                 meta.insert(
                     "clone".into(),
@@ -437,7 +610,13 @@ fn up(a: UpArgs) -> Result<()> {
 
         // The desktop runs as a transient service in the box's own slice.
         let exe = std::env::current_exe()?;
-        let out = Command::new("systemd-run")
+        let exec_stop_post = format!(
+            "--property=ExecStopPost={} __reap {}",
+            systemd_quote(&exe.display().to_string()),
+            b.name
+        );
+        let mut run_cmd = Command::new("systemd-run");
+        run_cmd
             .args(["--user", "--quiet", "--collect"])
             .arg(format!("--unit={}", b.unit()))
             .arg(format!("--slice={}", b.slice()))
@@ -445,22 +624,32 @@ fn up(a: UpArgs) -> Result<()> {
             .arg(format!("--property=RuntimeMaxSec={}", a.ttl))
             // When the desktop ends for any reason (down, TTL, crash), stop
             // the box's apps and delete its files, cookie copies included.
-            .arg(format!("--property=ExecStopPost={} __reap {}", exe.display(), b.name))
+            .arg(exec_stop_post)
             .args(self_env().iter().map(|kv| format!("--setenv={kv}")))
             .args(["env", "-i"])
             .args(self_env())
             .arg(&exe)
-            .args(["__stack", &b.name, "--size", &a.size])
-            .output()?;
+            .args(["__stack", &b.name, "--size", &a.size]);
+        if use_cua {
+            run_cmd.arg("--cua");
+        }
+        let out = run_cmd.output()?;
         if !out.status.success() {
-            bail!("systemd-run failed: {}", String::from_utf8_lossy(&out.stderr));
+            bail!(
+                "systemd-run failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
         let deadline = Instant::now() + Duration::from_secs(20);
         while b.display().is_none() {
             check_interrupt()?;
             let st = unit_state(&b.unit());
             if is_stopped(st.as_deref()) || Instant::now() > deadline {
-                bail!("desktop did not start ({}); journalctl --user -u {}", st.as_deref().unwrap_or("unknown"), b.unit());
+                bail!(
+                    "desktop did not start ({}); journalctl --user -u {}",
+                    st.as_deref().unwrap_or("unknown"),
+                    b.unit()
+                );
             }
             sleep(Duration::from_millis(10));
         }
@@ -473,17 +662,24 @@ fn up(a: UpArgs) -> Result<()> {
             "IOWeight=50",
         ])?;
         if !out.status.success() {
-            bail!("could not set --mem {}: {}", a.mem, String::from_utf8_lossy(&out.stderr).trim());
+            eprintln!(
+                "agent-box: warning: could not set --mem {} on {} ({}); continuing without cgroup limits",
+                a.mem,
+                b.slice(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
         }
         let display = ready_display(&b)?;
         let mut summary = json!({
             "name": b.name,
             "display": format!(":{display}"),
-            "cua_socket": b.cua_socket(),
             "dir": b.dir,
             "screen": format!("{w}x{h}"),
         });
-        if browser.is_some() {
+        if use_cua {
+            summary["cua_socket"] = json!(b.cua_socket());
+        }
+        if resolved_browser.is_some() {
             check_interrupt()?;
             start_browser(&b, &a.url)?;
             let cdp = wait_cdp(&b, Duration::from_secs(20))?;
@@ -504,7 +700,11 @@ fn up(a: UpArgs) -> Result<()> {
             // If the desktop ended while `up` held the lock, its cleanup left
             // the files to us. A box nobody got the name of must not stay up.
             let fail = if unit_state(&b.unit()).as_deref() != Some("active") {
-                Some(anyhow::anyhow!("box {} stopped during startup; journalctl --user -u {}", b.name, b.unit()))
+                Some(anyhow::anyhow!(
+                    "box {} stopped during startup; journalctl --user -u {}",
+                    b.name,
+                    b.unit()
+                ))
             } else if let Err(e) = check_interrupt() {
                 Some(e)
             } else {
@@ -529,11 +729,19 @@ fn up(a: UpArgs) -> Result<()> {
                     None => e,
                 });
             }
-            let _ = writeln!(
-                std::io::stderr(),
-                "next: agent-box call {n} list_windows   |   agent-box shot {n}   |   agent-box down {n}",
-                n = b.name
-            );
+            if use_cua {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "next: agent-box call {n} list_windows   |   agent-box shot {n}   |   agent-box down {n}",
+                    n = b.name
+                );
+            } else {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "next: agent-box cdp {n}   |   agent-box shot {n}   |   agent-box down {n}",
+                    n = b.name
+                );
+            }
             Ok(())
         }
         Err(e) => {
@@ -548,24 +756,17 @@ fn up(a: UpArgs) -> Result<()> {
     }
 }
 
-fn write_meta(b: &Box, meta: &Map<String, Value>) -> Result<()> {
+fn write_meta(b: &AgentBox, meta: &Map<String, Value>) -> Result<()> {
     fs::write(b.meta_file(), serde_json::to_vec_pretty(meta)?)?;
     Ok(())
 }
 
-fn read_meta(b: &Box) -> Map<String, Value> {
+fn read_meta(b: &AgentBox) -> Map<String, Value> {
     fs::read(b.meta_file())
         .ok()
         .and_then(|d| serde_json::from_slice::<Value>(&d).ok())
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default()
-}
-
-fn default_browser() -> Option<PathBuf> {
-    ["/opt/helium-browser-bin/helium", "/usr/bin/chromium"]
-        .iter()
-        .map(PathBuf::from)
-        .find(|p| p.is_file())
 }
 
 fn last_used_profile(src: &Path) -> String {
@@ -577,11 +778,16 @@ fn last_used_profile(src: &Path) -> String {
 }
 
 /// Start a program in the box as its own transient unit in the box's slice.
-fn start_app(b: &Box, label: &str, cmd: &[String]) -> Result<String> {
+fn start_app(b: &AgentBox, label: &str, cmd: &[String]) -> Result<String> {
     let display = ready_display(b)?;
     static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let unit = format!("{}-{label}-{}-{}-{seq}", b.unit(), now_ms(), std::process::id());
+    let unit = format!(
+        "{}-{label}-{}-{}-{seq}",
+        b.unit(),
+        now_ms(),
+        std::process::id()
+    );
     let out = Command::new("systemd-run")
         .args(["--user", "--quiet", "--collect"])
         .arg(format!("--unit={unit}"))
@@ -593,23 +799,29 @@ fn start_app(b: &Box, label: &str, cmd: &[String]) -> Result<String> {
         .arg(format!("--property=After={}.service", b.unit()))
         .arg(format!("--working-directory={}", b.home().display()))
         .args(["env", "-i"])
-        .args(b.app_env(display).into_iter().map(|(k, v)| format!("{k}={v}")))
+        .args(
+            b.app_env(display)
+                .into_iter()
+                .map(|(k, v)| format!("{k}={v}")),
+        )
         .args(cmd)
         .output()?;
     if !out.status.success() {
-        bail!("could not start {:?}: {}", cmd, String::from_utf8_lossy(&out.stderr));
+        bail!(
+            "could not start {:?}: {}",
+            cmd,
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     Ok(unit)
 }
 
-fn start_browser(b: &Box, url: &str) -> Result<()> {
+fn start_browser(b: &AgentBox, url: &str) -> Result<()> {
     let meta = read_meta(b);
-    let browser = meta
-        .get("browser")
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .or_else(default_browser)
-        .context("no browser for this box")?;
+    let browser = match meta.get("browser").and_then(Value::as_str) {
+        Some(p) => PathBuf::from(p),
+        None => browser::detect().context("no browser for this box")?.binary,
+    };
     let mut cmd = vec![
         browser.display().to_string(),
         format!("--user-data-dir={}", b.browser_dir().display()),
@@ -618,6 +830,7 @@ fn start_browser(b: &Box, url: &str) -> Result<()> {
         "--force-renderer-accessibility".into(),
         "--remote-debugging-address=127.0.0.1".into(),
         "--remote-debugging-port=0".into(),
+        "--disable-sync".into(),
         "--no-first-run".into(),
         "--no-default-browser-check".into(),
         "--hide-crash-restore-bubble".into(),
@@ -632,7 +845,7 @@ fn start_browser(b: &Box, url: &str) -> Result<()> {
     Ok(())
 }
 
-fn cdp_port(b: &Box) -> Option<u16> {
+fn cdp_port(b: &AgentBox) -> Option<u16> {
     fs::read_to_string(b.browser_dir().join("DevToolsActivePort"))
         .ok()?
         .lines()
@@ -642,12 +855,13 @@ fn cdp_port(b: &Box) -> Option<u16> {
         .ok()
 }
 
-fn cdp_url(b: &Box) -> Result<String> {
-    let port = cdp_port(b).context("box browser is not running; start it with `agent-box open NAME URL`")?;
+fn cdp_url(b: &AgentBox) -> Result<String> {
+    let port = cdp_port(b)
+        .context("box browser is not running; start it with `agent-box open NAME URL`")?;
     Ok(format!("http://127.0.0.1:{port}"))
 }
 
-fn wait_cdp(b: &Box, timeout: Duration) -> Result<String> {
+fn wait_cdp(b: &AgentBox, timeout: Duration) -> Result<String> {
     let deadline = Instant::now() + timeout;
     loop {
         check_interrupt()?;
@@ -657,7 +871,10 @@ fn wait_cdp(b: &Box, timeout: Duration) -> Result<String> {
             }
         }
         if Instant::now() > deadline {
-            bail!("browser did not open its DevTools port; logs: journalctl --user -u '{}-browser-*'", b.unit());
+            bail!(
+                "browser did not open its DevTools port; logs: journalctl --user -u '{}-browser-*'",
+                b.unit()
+            );
         }
         sleep(Duration::from_millis(25));
     }
@@ -665,14 +882,18 @@ fn wait_cdp(b: &Box, timeout: Duration) -> Result<String> {
 
 /// Stop every process in the box, check that they stopped, then delete its
 /// files. Files stay when the stop cannot be confirmed.
-fn destroy(b: &Box) -> Result<()> {
-    let _lock = lock_name(b, Duration::from_secs(30))?
-        .with_context(|| format!("box {} is busy (another agent-box command holds it)", b.name))?;
+fn destroy(b: &AgentBox) -> Result<()> {
+    let _lock = lock_name(b, Duration::from_secs(30))?.with_context(|| {
+        format!(
+            "box {} is busy (another agent-box command holds it)",
+            b.name
+        )
+    })?;
     destroy_locked(b)
 }
 
 /// `destroy` for a caller that already holds the name lock.
-fn destroy_locked(b: &Box) -> Result<()> {
+fn destroy_locked(b: &AgentBox) -> Result<()> {
     let out = systemctl(&["stop", &b.slice()])?;
     let st = unit_state(&b.slice());
     if !is_stopped(st.as_deref()) {
@@ -683,11 +904,16 @@ fn destroy_locked(b: &Box) -> Result<()> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let _ = systemctl(&["reset-failed", &format!("{}.service", b.unit()), &format!("{}-*", b.unit()), &b.slice()]);
+    let _ = systemctl(&[
+        "reset-failed",
+        &format!("{}.service", b.unit()),
+        &format!("{}-*", b.unit()),
+        &b.slice(),
+    ]);
     remove_files(b)
 }
 
-fn remove_files(b: &Box) -> Result<()> {
+fn remove_files(b: &AgentBox) -> Result<()> {
     let (state, run) = paths::roots();
     for (dir, root) in [(&b.dir, &state), (&b.run, &run)] {
         if paths::is_inside(dir, root) && dir.exists() {
@@ -699,14 +925,20 @@ fn remove_files(b: &Box) -> Result<()> {
 
 /// Copy a box's logs to the runtime directory (tmpfs, cleared at logout)
 /// before its state directory is deleted.
-fn keep_logs(b: &Box) -> Option<PathBuf> {
+fn keep_logs(b: &AgentBox) -> Option<PathBuf> {
     let from = b.dir.join("logs");
     let (_, run) = paths::roots();
-    let to = run.with_file_name("agent-box-logs").join(format!("{}-{}", b.name, now_ms()));
+    let to = run
+        .with_file_name("agent-box-logs")
+        .join(format!("{}-{}", b.name, now_ms()));
     let mut kept = false;
     for e in fs::read_dir(&from).ok()?.flatten() {
         if e.file_type().is_ok_and(|t| t.is_file()) {
-            fs::DirBuilder::new().recursive(true).mode(0o700).create(&to).ok()?;
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&to)
+                .ok()?;
             kept |= fs::copy(e.path(), to.join(e.file_name())).is_ok();
         }
     }
@@ -717,7 +949,7 @@ fn keep_logs(b: &Box) -> Option<PathBuf> {
 /// cookie copies do not outlive the box. If another command holds the name
 /// lock, that command deletes the files: `down` does, and `up` checks the
 /// desktop after it lets go. Keeps logs when the desktop did not end cleanly.
-fn reap_stopped(b: &Box) -> Result<()> {
+fn reap_stopped(b: &AgentBox) -> Result<()> {
     // Never the desktop unit itself: this runs inside its stop.
     let _ = systemctl(&["stop", &format!("{}-*.service", b.unit())]);
     let r = match lock_name(b, Duration::ZERO)? {
@@ -725,7 +957,11 @@ fn reap_stopped(b: &Box) -> Result<()> {
             if std::env::var("SERVICE_RESULT").is_ok_and(|r| r != "success") {
                 if let Some(dir) = keep_logs(b) {
                     let why = std::env::var("SERVICE_RESULT").unwrap_or_default();
-                    eprintln!("agent-box: {} ended ({why}); logs kept in {}", b.name, dir.display());
+                    eprintln!(
+                        "agent-box: {} ended ({why}); logs kept in {}",
+                        b.name,
+                        dir.display()
+                    );
                 }
             }
             remove_files(b)
@@ -741,17 +977,39 @@ fn reap_stopped(b: &Box) -> Result<()> {
 /// run), so their cookie copies do not linger. Skips boxes that are still
 /// being created, and boxes whose state systemd does not report. Locks only
 /// boxes that are already stopped, so it never blocks a live box's cleanup.
-fn reap_dead() {
+fn reap_dead() -> Vec<String> {
+    let mut removed = Vec::new();
     for n in paths::all_names() {
-        let Ok(b) = Box::new(&n) else { continue };
+        let Ok(b) = AgentBox::new(&n) else { continue };
         if !is_stopped(unit_state(&b.unit()).as_deref()) {
             continue;
         }
-        let Ok(Some(_lock)) = lock_name(&b, Duration::ZERO) else { continue };
-        if b.dir.exists() && is_stopped(unit_state(&b.unit()).as_deref()) && destroy_locked(&b).is_ok() {
-            eprintln!("agent-box: removed stopped box {n}");
+        let Ok(Some(_lock)) = lock_name(&b, Duration::ZERO) else {
+            continue;
+        };
+        if b.dir.exists()
+            && is_stopped(unit_state(&b.unit()).as_deref())
+            && destroy_locked(&b).is_ok()
+        {
+            removed.push(n);
         }
     }
+    removed
+}
+
+fn gc() -> Result<()> {
+    if !user_manager_ok() {
+        bail!("cannot reach the systemd user manager (systemctl --user)");
+    }
+    let removed = reap_dead();
+    if removed.is_empty() {
+        println!("no stopped boxes to clean");
+    } else {
+        for n in removed {
+            println!("removed {n}");
+        }
+    }
+    Ok(())
 }
 
 fn down(names: Vec<String>, all: bool) -> Result<()> {
@@ -764,7 +1022,7 @@ fn down(names: Vec<String>, all: bool) -> Result<()> {
         bail!("no box named {n}; see `agent-box ls`");
     }
     for n in names {
-        destroy(&Box::new(&n)?)?;
+        destroy(&AgentBox::new(&n)?)?;
         println!("removed {n}");
     }
     Ok(())
@@ -773,10 +1031,15 @@ fn down(names: Vec<String>, all: bool) -> Result<()> {
 fn ls(as_json: bool) -> Result<()> {
     let mut rows = Vec::new();
     for n in all_boxes() {
-        let b = Box::new(&n)?;
+        let b = AgentBox::new(&n)?;
         let mem = systemctl(&["show", "-p", "MemoryCurrent", "--value", &b.slice()])
             .ok()
-            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok());
+            .and_then(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+            });
         let state = unit_state(&b.unit()).unwrap_or_else(|| "unknown".into());
         let live = state == "active";
         rows.push(json!({
@@ -793,14 +1056,20 @@ fn ls(as_json: bool) -> Result<()> {
     } else if rows.is_empty() {
         println!("no boxes; create one with `agent-box up`");
     } else {
-        println!("{:<10} {:<9} {:<8} {:>7}  CDP", "NAME", "STATE", "DISPLAY", "MEM_MB");
+        println!(
+            "{:<10} {:<9} {:<8} {:>7}  CDP",
+            "NAME", "STATE", "DISPLAY", "MEM_MB"
+        );
         for r in rows {
             println!(
                 "{:<10} {:<9} {:<8} {:>7}  {}",
                 r["name"].as_str().unwrap_or(""),
                 r["state"].as_str().unwrap_or(""),
                 r["display"].as_str().unwrap_or("-"),
-                r["mem_mb"].as_u64().map(|m| m.to_string()).unwrap_or("-".into()),
+                r["mem_mb"]
+                    .as_u64()
+                    .map(|m| m.to_string())
+                    .unwrap_or("-".into()),
                 r["cdp"].as_str().unwrap_or("-"),
             );
         }
@@ -811,22 +1080,49 @@ fn ls(as_json: bool) -> Result<()> {
 /// Pointer and keyboard tools. In a private box, foreground delivery reaches
 /// no user window, and background raw input is refused for most browsers.
 const INPUT_TOOLS: &[&str] = &[
-    "click", "double_click", "right_click", "drag", "mouse_drag", "scroll", "move_cursor",
-    "mouse_button_down", "mouse_button_up", "type_text", "press_key", "hotkey",
+    "click",
+    "double_click",
+    "right_click",
+    "drag",
+    "mouse_drag",
+    "scroll",
+    "move_cursor",
+    "mouse_button_down",
+    "mouse_button_up",
+    "type_text",
+    "press_key",
+    "hotkey",
 ];
 
-pub fn prepare_call_args(name: &str, tool: &str, mut args: Map<String, Value>) -> Map<String, Value> {
+pub fn prepare_call_args(
+    name: &str,
+    tool: &str,
+    mut args: Map<String, Value>,
+) -> Map<String, Value> {
     args.entry("session").or_insert_with(|| json!(name));
     let semantic = args.contains_key("element_token") || args.contains_key("element_index");
     if INPUT_TOOLS.contains(&tool) && !semantic {
-        args.entry("delivery_mode").or_insert_with(|| json!("foreground"));
+        args.entry("delivery_mode")
+            .or_insert_with(|| json!("foreground"));
     }
     args
 }
 
-fn call(name: &str, tool: &str, raw: Option<String>, shot: Option<PathBuf>, timeout: u64) -> Result<ExitCode> {
+fn call(
+    name: &str,
+    tool: &str,
+    raw: Option<String>,
+    shot: Option<PathBuf>,
+    timeout: u64,
+) -> Result<ExitCode> {
     let b = existing(name)?;
     ready_display(&b)?;
+    if !b.cua_socket().exists() {
+        bail!(
+            "box {name} was started without cua-driver (no {}); install cua-driver and start a box with `--cua on`, or use `agent-box cdp {name}`",
+            b.cua_socket().display()
+        );
+    }
     let raw = match raw.as_deref() {
         Some("-") => {
             let mut s = String::new();
@@ -836,14 +1132,22 @@ fn call(name: &str, tool: &str, raw: Option<String>, shot: Option<PathBuf>, time
         Some(r) => r.to_string(),
         None => "{}".into(),
     };
-    let raw = if raw.trim().is_empty() { "{}".to_string() } else { raw };
-    let args = match serde_json::from_str::<Value>(&raw).context("arguments must be a JSON object")? {
-        Value::Object(m) => m,
-        _ => bail!("arguments must be a JSON object"),
+    let raw = if raw.trim().is_empty() {
+        "{}".to_string()
+    } else {
+        raw
     };
+    let args =
+        match serde_json::from_str::<Value>(&raw).context("arguments must be a JSON object")? {
+            Value::Object(m) => m,
+            _ => bail!("arguments must be a JSON object"),
+        };
     let args = prepare_call_args(name, tool, args);
     let mut cmd = Command::new("cua-driver");
-    cmd.arg("call").arg("--socket").arg(b.cua_socket()).arg(tool);
+    cmd.arg("call")
+        .arg("--socket")
+        .arg(b.cua_socket())
+        .arg(tool);
     if let Some(f) = shot {
         cmd.arg("--screenshot-out-file").arg(f);
     }
@@ -871,7 +1175,9 @@ fn call(name: &str, tool: &str, raw: Option<String>, shot: Option<PathBuf>, time
             // SAFETY: the handler only calls async-signal-safe kill and
             // _exit. A signal the caller ignores (nohup) stays ignored.
             unsafe {
-                if libc::signal(sig, end_call_group as *const () as libc::sighandler_t) == libc::SIG_IGN {
+                if libc::signal(sig, end_call_group as *const () as libc::sighandler_t)
+                    == libc::SIG_IGN
+                {
                     libc::signal(sig, libc::SIG_IGN);
                 }
             }
@@ -900,7 +1206,11 @@ fn call(name: &str, tool: &str, raw: Option<String>, shot: Option<PathBuf>, time
         }
         sleep(Duration::from_millis(20));
     };
-    Ok(if status.success() { ExitCode::SUCCESS } else { ExitCode::from(status.code().unwrap_or(1) as u8) })
+    Ok(if status.success() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(status.code().unwrap_or(1) as u8)
+    })
 }
 
 static CALL_GROUP: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
@@ -916,7 +1226,7 @@ extern "C" fn end_call_group(sig: libc::c_int) {
     }
 }
 
-fn shot(b: &Box, file: Option<PathBuf>) -> Result<PathBuf> {
+fn shot(b: &AgentBox, file: Option<PathBuf>) -> Result<PathBuf> {
     let display = ready_display(b)?;
     let file = match file {
         Some(f) => f,
@@ -926,51 +1236,158 @@ fn shot(b: &Box, file: Option<PathBuf>) -> Result<PathBuf> {
             dir.join(format!("{}.png", now_ms()))
         }
     };
-    let status = Command::new("import")
-        .env("DISPLAY", format!(":{display}"))
-        .env("XAUTHORITY", b.xauth())
-        .args(["-window", "root"])
-        .arg(&file)
-        .status()?;
-    if !status.success() {
-        bail!("screenshot failed");
-    }
+    screenshot::capture_root_png(display, &b.xauth(), &file)?;
     Ok(file)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DistroFamily {
+    Arch,
+    Debian,
+    Fedora,
+    Unknown,
+}
+
+fn detect_distro(os_release: &str) -> DistroFamily {
+    let mut tokens = Vec::new();
+    for line in os_release.lines() {
+        let line = line.trim();
+        if let Some(rest) = line
+            .strip_prefix("ID=")
+            .or_else(|| line.strip_prefix("ID_LIKE="))
+        {
+            let unquoted = rest.trim_matches(|c| c == '"' || c == '\'');
+            for tok in unquoted.split_whitespace() {
+                tokens.push(tok.to_ascii_lowercase());
+            }
+        }
+    }
+    for tok in &tokens {
+        match tok.as_str() {
+            "arch" | "omarchy" | "cachyos" | "endeavouros" | "manjaro" => {
+                return DistroFamily::Arch
+            }
+            "debian" | "ubuntu" | "linuxmint" | "pop" | "elementary" => {
+                return DistroFamily::Debian
+            }
+            "fedora" | "rhel" | "centos" | "rocky" | "almalinux" => return DistroFamily::Fedora,
+            _ => {}
+        }
+    }
+    DistroFamily::Unknown
+}
+
+fn distro_pkg(
+    distro: DistroFamily,
+    arch: &'static str,
+    debian: &'static str,
+    fedora: &'static str,
+) -> &'static str {
+    match distro {
+        DistroFamily::Arch => arch,
+        DistroFamily::Debian => debian,
+        DistroFamily::Fedora => fedora,
+        DistroFamily::Unknown => arch,
+    }
+}
+
+fn install_hint(distro: DistroFamily, pkg: &str) -> String {
+    match distro {
+        DistroFamily::Arch => format!("pacman -S {pkg}"),
+        DistroFamily::Debian => format!("apt install {pkg}"),
+        DistroFamily::Fedora => format!("dnf install {pkg}"),
+        DistroFamily::Unknown => format!("install {pkg}"),
+    }
+}
+
 fn doctor() -> Result<ExitCode> {
+    let distro = fs::read_to_string("/etc/os-release")
+        .map(|s| detect_distro(&s))
+        .unwrap_or(DistroFamily::Unknown);
     let mut ok = true;
+    let mut missing_pkgs: Vec<&'static str> = Vec::new();
     let mut check = |what: &str, good: bool, fix: &str| {
-        println!("{} {what}{}", if good { "ok  " } else { "FAIL" }, if good { String::new() } else { format!("  ({fix})") });
+        println!(
+            "{} {what}{}",
+            if good { "ok  " } else { "FAIL" },
+            if good {
+                String::new()
+            } else {
+                format!("  ({fix})")
+            }
+        );
         ok &= good;
     };
-    let on_path = |p: &str| {
-        Command::new("sh").args(["-c", &format!("command -v {p}")]).stdout(Stdio::null()).status().is_ok_and(|s| s.success())
-    };
-    for (bin, pkg) in [
-        ("Xvfb", "xorg-server-xvfb"),
-        ("openbox", "openbox"),
-        ("dbus-daemon", "dbus"),
-        ("dbus-send", "dbus"),
-        ("cua-driver", "cua-driver-bin"),
-        ("systemd-run", "systemd"),
-        ("import", "imagemagick"),
-        ("secret-tool", "libsecret"),
+
+    for (bin, arch_pkg, deb_pkg, fed_pkg) in [
+        ("Xvfb", "xorg-server-xvfb", "xvfb", "xorg-x11-server-Xvfb"),
+        ("openbox", "openbox", "openbox", "openbox"),
+        ("dbus-daemon", "dbus", "dbus", "dbus-daemon"),
+        ("dbus-send", "dbus", "dbus", "dbus-tools"),
+        ("systemd-run", "systemd", "systemd", "systemd"),
+        ("secret-tool", "libsecret", "libsecret-tools", "libsecret"),
     ] {
-        check(bin, on_path(bin), &format!("install {pkg}"));
+        let pkg = distro_pkg(distro, arch_pkg, deb_pkg, fed_pkg);
+        let found = paths::find_on_path(bin).is_some();
+        if !found && !missing_pkgs.contains(&pkg) {
+            missing_pkgs.push(pkg);
+        }
+        check(bin, found, &install_hint(distro, pkg));
     }
-    for f in ["/usr/lib/at-spi-bus-launcher", "/usr/lib/at-spi2-registryd"] {
-        check(f, Path::new(f).is_file(), "install at-spi2-core");
+
+    if paths::find_on_path("cua-driver").is_some() {
+        println!("ok   cua-driver");
+    } else {
+        println!("info cua-driver  (optional; install for GUI accessibility calls, CDP works without it)");
     }
-    check("browser", default_browser().is_some(), "install helium-browser-bin or chromium");
-    let src = profile::default_source();
+
+    for name in ["at-spi-bus-launcher", "at-spi2-registryd"] {
+        let pkg = distro_pkg(distro, "at-spi2-core", "at-spi2-core", "at-spi2-core");
+        match stack::find_atspi_binary(name) {
+            Some(path) => println!("ok   {name}  ({})", path.display()),
+            None => {
+                if !missing_pkgs.contains(&pkg) {
+                    missing_pkgs.push(pkg);
+                }
+                check(name, false, &install_hint(distro, pkg));
+            }
+        }
+    }
+
+    match browser::detect() {
+        Ok(det) => {
+            println!("ok   browser  {} ({})", det.kind, det.binary.display());
+            let has_state = det.data_dir.join("Local State").is_file();
+            check(
+                &format!("profile  {}", det.data_dir.display()),
+                has_state,
+                &format!(
+                    "open {} once to create a profile, or pass --from/--blank",
+                    det.kind
+                ),
+            );
+        }
+        Err(err) => {
+            check("browser", false, &err.to_string());
+        }
+    }
+
     check(
-        &format!("main profile {}", src.display()),
-        src.join("Local State").is_file(),
-        "sign in to Helium once, or pass --from/--blank",
+        "systemd user manager",
+        user_manager_ok(),
+        "needs a systemd user session",
     );
-    check("systemd user manager", user_manager_ok(), "needs a systemd user session");
-    Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+
+    if !missing_pkgs.is_empty() {
+        let joined = missing_pkgs.join(" ");
+        println!("\nmissing dependencies: {}", install_hint(distro, &joined));
+    }
+
+    Ok(if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
 #[cfg(test)]
@@ -989,7 +1406,10 @@ mod tests {
         let a = prepare_call_args(
             "b1",
             "click",
-            Map::from_iter([("element_token".into(), json!("s1:2")), ("session".into(), json!("mine"))]),
+            Map::from_iter([
+                ("element_token".into(), json!("s1:2")),
+                ("session".into(), json!("mine")),
+            ]),
         );
         assert_eq!(a["session"], "mine");
         assert!(a.get("delivery_mode").is_none());
@@ -1017,5 +1437,54 @@ mod tests {
     fn sizes() {
         assert_eq!(parse_size("1440x900").unwrap(), (1440, 900));
         assert!(parse_size("big").is_err());
+    }
+
+    #[test]
+    fn cua_mode_resolution() {
+        assert!(!resolve_cua(CuaMode::Off, true).unwrap());
+        assert!(!resolve_cua(CuaMode::Off, false).unwrap());
+        assert!(resolve_cua(CuaMode::Auto, true).unwrap());
+        assert!(!resolve_cua(CuaMode::Auto, false).unwrap());
+        assert!(resolve_cua(CuaMode::On, true).unwrap());
+        assert!(resolve_cua(CuaMode::On, false).is_err());
+    }
+
+    #[test]
+    fn systemd_quoting_handles_spaces_quotes_and_percent() {
+        assert_eq!(
+            systemd_quote("/usr/bin/agent-box"),
+            r#""/usr/bin/agent-box""#
+        );
+        assert_eq!(
+            systemd_quote("/home/my user/100%/agent\"box"),
+            r#""/home/my user/100%%/agent\"box""#
+        );
+    }
+
+    #[test]
+    fn distro_detection_and_hints() {
+        assert_eq!(
+            detect_distro("ID=omarchy\nID_LIKE=arch\n"),
+            DistroFamily::Arch
+        );
+        assert_eq!(
+            detect_distro("ID=ubuntu\nID_LIKE=\"debian\"\n"),
+            DistroFamily::Debian
+        );
+        assert_eq!(detect_distro("ID=fedora\n"), DistroFamily::Fedora);
+        assert_eq!(detect_distro("ID=nixos\n"), DistroFamily::Unknown);
+
+        assert_eq!(
+            install_hint(DistroFamily::Arch, "xorg-server-xvfb"),
+            "pacman -S xorg-server-xvfb"
+        );
+        assert_eq!(
+            install_hint(DistroFamily::Debian, "xvfb"),
+            "apt install xvfb"
+        );
+        assert_eq!(
+            install_hint(DistroFamily::Fedora, "xorg-x11-server-Xvfb"),
+            "dnf install xorg-x11-server-Xvfb"
+        );
     }
 }

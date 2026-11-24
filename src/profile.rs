@@ -1,19 +1,20 @@
 //! Clone a Chromium-family profile so a sandbox starts signed in like it.
 //!
-//! The clone is copy-on-write (btrfs/XFS reflink) and skips caches, history
-//! and saved passwords. Cookies are re-encrypted from the keyring key (`v11`)
-//! to Chromium's fixed "basic" key (`v10`), so the sandbox browser needs no
-//! keyring and the keyring password never leaves this process.
+//! The clone is copy-on-write (btrfs/XFS reflink) and skips caches, history,
+//! extensions (by default) and saved passwords. Cookies are re-encrypted from
+//! the keyring key (`v11`) to Chromium's fixed "basic" key (`v10`), so the
+//! sandbox browser needs no keyring and the keyring password never leaves this
+//! process.
 
 use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
-use std::io::Read;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
@@ -62,6 +63,24 @@ const SKIP: &[&str] = &[
     "DevToolsActivePort",
 ];
 
+/// Browser extension directories skipped by default unless `--with-extensions`
+/// is passed on `agent-box up`.
+const SKIP_EXTENSIONS: &[&str] = &[
+    "Extensions",
+    "Local Extension Settings",
+    "Sync Extension Settings",
+    "Extension State",
+    "Extension Rules",
+    "Extension Scripts",
+    "Managed Extension Settings",
+    "Storage/ext",
+];
+
+pub struct CloneOptions<'a> {
+    pub keyring_apps: &'a [&'a str],
+    pub with_extensions: bool,
+}
+
 pub struct CloneReport {
     pub files: usize,
     pub cookies: usize,
@@ -96,10 +115,23 @@ fn plaintext_ok(plain: &[u8], host: &str, hashed: bool) -> bool {
     plain.len() >= 32 && plain[..32] == Sha256::digest(host.as_bytes())[..]
 }
 
+fn should_skip(rel: &Path, with_extensions: bool) -> bool {
+    SKIP.iter().any(|s| Path::new(s) == rel)
+        || (!with_extensions && SKIP_EXTENSIONS.iter().any(|s| Path::new(s) == rel))
+}
+
 /// Clone `src_root/<profile>` (plus a trimmed `Local State`) into `dst_root`.
-pub fn clone_profile(src_root: &Path, profile: &str, dst_root: &Path) -> Result<CloneReport> {
+pub fn clone_profile(
+    src_root: &Path,
+    profile: &str,
+    dst_root: &Path,
+    opts: &CloneOptions<'_>,
+) -> Result<CloneReport> {
     let mut parts = Path::new(profile).components();
-    if !matches!((parts.next(), parts.next()), (Some(std::path::Component::Normal(_)), None)) {
+    if !matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    ) {
         bail!("profile must be one directory name inside the browser data directory: {profile:?}");
     }
     let src_profile = src_root.join(profile);
@@ -109,16 +141,33 @@ pub fn clone_profile(src_root: &Path, profile: &str, dst_root: &Path) -> Result<
     mkdir_private(dst_root)?;
     let dst_profile = dst_root.join(profile);
     let mut files = 0;
-    copy_tree(&src_profile, &dst_profile, Path::new(""), &mut files)?;
+    copy_tree(
+        &src_profile,
+        &dst_profile,
+        Path::new(""),
+        opts.with_extensions,
+        &mut files,
+    )?;
     write_local_state(src_root, profile, dst_root)?;
     fix_preferences(&dst_profile)?;
 
-    let mut report = CloneReport { files, cookies: 0, cookies_dropped: 0, key_source: "none".into() };
+    let mut report = CloneReport {
+        files,
+        cookies: 0,
+        cookies_dropped: 0,
+        key_source: "none".into(),
+    };
     for rel in ["Cookies", "Network/Cookies"] {
         let db = dst_profile.join(rel);
         if db.is_file() {
             ensure_consistent_db(&src_profile.join(rel), &db)?;
-            reencrypt_cookies(&db, &mut report, keyring_password)?;
+            reencrypt_cookies(
+                &db,
+                opts.keyring_apps,
+                is_kde_session_env(),
+                &mut report,
+                keyring_password,
+            )?;
         }
     }
     Ok(report)
@@ -128,10 +177,18 @@ pub fn clone_profile(src_root: &Path, profile: &str, dst_root: &Path) -> Result<
 /// copied with the database, so opening the copy rolls back any partial
 /// transaction. If the copy still fails an integrity check, copy again.
 fn ensure_consistent_db(src: &Path, dst: &Path) -> Result<()> {
-    let journal = |p: &Path| p.with_file_name(format!("{}-journal", p.file_name().unwrap().to_string_lossy()));
+    let journal = |p: &Path| {
+        p.with_file_name(format!(
+            "{}-journal",
+            p.file_name().unwrap().to_string_lossy()
+        ))
+    };
     for attempt in 0..5 {
         if attempt > 0 {
-            for (from, to) in [(src.to_path_buf(), dst.to_path_buf()), (journal(src), journal(dst))] {
+            for (from, to) in [
+                (src.to_path_buf(), dst.to_path_buf()),
+                (journal(src), journal(dst)),
+            ] {
                 let _ = fs::remove_file(&to);
                 if from.is_file() {
                     clone_file(&from, &to)?;
@@ -157,13 +214,19 @@ fn mkdir_private(dir: &Path) -> Result<()> {
         .with_context(|| format!("create {}", dir.display()))
 }
 
-fn copy_tree(src: &Path, dst: &Path, rel: &Path, files: &mut usize) -> Result<()> {
+fn copy_tree(
+    src: &Path,
+    dst: &Path,
+    rel: &Path,
+    with_extensions: bool,
+    files: &mut usize,
+) -> Result<()> {
     mkdir_private(dst)?;
     for entry in fs::read_dir(src).with_context(|| format!("read {}", src.display()))? {
         let entry = entry?;
         let name = entry.file_name();
         let rel_child = rel.join(&name);
-        if SKIP.iter().any(|s| Path::new(s) == rel_child) {
+        if should_skip(&rel_child, with_extensions) {
             continue;
         }
         let from = entry.path();
@@ -172,7 +235,7 @@ fn copy_tree(src: &Path, dst: &Path, rel: &Path, files: &mut usize) -> Result<()
         // Symlinks are skipped: a link copied as-is would point the box back
         // into the main profile, and the box would write through it.
         if kind.is_dir() {
-            copy_tree(&from, &to, &rel_child, files)?;
+            copy_tree(&from, &to, &rel_child, with_extensions, files)?;
         } else if kind.is_file() {
             clone_file(&from, &to).with_context(|| format!("copy {}", from.display()))?;
             *files += 1;
@@ -225,7 +288,11 @@ pub fn trim_local_state(mut state: Value, profile: &str) -> Value {
 
 fn write_local_state(src_root: &Path, profile: &str, dst_root: &Path) -> Result<()> {
     let src = src_root.join("Local State");
-    let state = if src.is_file() { read_json(&src)? } else { json!({}) };
+    let state = if src.is_file() {
+        read_json(&src)?
+    } else {
+        json!({})
+    };
     let state = trim_local_state(state, profile);
     fs::write(dst_root.join("Local State"), serde_json::to_vec(&state)?)?;
     Ok(())
@@ -247,8 +314,30 @@ fn fix_preferences(dst_profile: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Keyring entries that can hold a Chromium-family "Safe Storage" password.
-const KEYRING_APPS: &[&str] = &["helium", "chromium"];
+fn is_kde_session(xdg_current_desktop: Option<&str>, kde_full_session: Option<&str>) -> bool {
+    xdg_current_desktop.is_some_and(|v| v.to_ascii_lowercase().contains("kde"))
+        || kde_full_session.is_some_and(|v| !v.is_empty())
+}
+
+fn is_kde_session_env() -> bool {
+    is_kde_session(
+        std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref(),
+        std::env::var("KDE_FULL_SESSION").ok().as_deref(),
+    )
+}
+
+fn cookie_decrypt_error(keyring_apps: &[&str], kde_session: bool) -> String {
+    let mut msg = format!(
+        "could not decrypt the profile's cookies with any keyring entry ({}); is the keyring unlocked?",
+        keyring_apps.join(", ")
+    );
+    if kde_session {
+        msg.push_str(
+            "\nnote: KDE KWallet is not yet supported in v0.1; use GNOME Keyring / Secret Service or pass --blank",
+        );
+    }
+    msg
+}
 
 /// Read a keyring secret. `secret-tool search` without `--unlock` returns
 /// only unlocked items, so it never puts an unlock prompt on the user's
@@ -285,6 +374,8 @@ const MAX_COOKIE_DB_VERSION: i64 = 24;
 /// returns the keyring password for an application name, if any.
 fn reencrypt_cookies(
     db: &Path,
+    keyring_apps: &[&str],
+    kde_session: bool,
     report: &mut CloneReport,
     password_for: impl Fn(&str) -> Option<Vec<u8>>,
 ) -> Result<()> {
@@ -313,7 +404,10 @@ fn reencrypt_cookies(
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     if !unknown.is_empty() {
-        bail!("{}: cookies use unsupported encryption {unknown:?}; only v10 and v11 are supported", db.display());
+        bail!(
+            "{}: cookies use unsupported encryption {unknown:?}; only v10 and v11 are supported",
+            db.display()
+        );
     }
 
     let rows: Vec<(i64, String, Vec<u8>)> = conn
@@ -326,7 +420,7 @@ fn reencrypt_cookies(
 
     // Pick the keyring entry that actually decrypts this profile's cookies.
     let mut key11 = None;
-    for app in KEYRING_APPS {
+    for app in keyring_apps {
         if let Some(pw) = password_for(app) {
             let key = key_from_password(&pw);
             let hits = rows
@@ -344,10 +438,7 @@ fn reencrypt_cookies(
         }
     }
     let Some(key11) = key11 else {
-        bail!(
-            "could not decrypt the profile's cookies with any keyring entry ({}); is the keyring unlocked?",
-            KEYRING_APPS.join(", ")
-        );
+        bail!("{}", cookie_decrypt_error(keyring_apps, kde_session));
     };
     let key10 = key_from_password(BASIC_PASSWORD);
 
@@ -374,10 +465,6 @@ fn reencrypt_cookies(
     Ok(())
 }
 
-pub fn default_source() -> PathBuf {
-    crate::paths::home().join(".config/net.imput.helium")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,25 +479,67 @@ mod tests {
     #[test]
     fn profile_name_is_one_component() {
         let tmp = std::env::temp_dir();
+        let opts = CloneOptions {
+            keyring_apps: &["chromium"],
+            with_extensions: false,
+        };
         for bad in ["../Default", "a/b", "/etc", "", "."] {
-            assert!(clone_profile(&tmp, bad, &tmp.join("x")).is_err(), "{bad}");
+            assert!(
+                clone_profile(&tmp, bad, &tmp.join("x"), &opts).is_err(),
+                "{bad}"
+            );
         }
     }
 
     #[test]
-    fn copy_tree_skips_symlinks() {
+    fn copy_tree_skips_symlinks_and_extensions_by_default() {
         let root = std::env::temp_dir().join(format!("agent-box-link-{}", std::process::id()));
-        let (src, dst) = (root.join("src"), root.join("dst"));
+        let _ = fs::remove_dir_all(&root);
+        let (src, dst_no_ext, dst_with_ext) = (
+            root.join("src"),
+            root.join("dst_no_ext"),
+            root.join("dst_with_ext"),
+        );
         fs::create_dir_all(src.join("Cache")).unwrap();
+        fs::create_dir_all(src.join("Extensions/abc")).unwrap();
+        fs::create_dir_all(src.join("Local Extension Settings/abc")).unwrap();
+        fs::create_dir_all(src.join("Storage/ext/abc")).unwrap();
+        fs::create_dir_all(src.join("Storage/keep")).unwrap();
         fs::write(src.join("Preferences"), "{}").unwrap();
         fs::write(src.join("Cache/x"), "cached").unwrap();
+        fs::write(src.join("Extensions/abc/manifest.json"), "{}").unwrap();
+        fs::write(src.join("Local Extension Settings/abc/data"), "secret").unwrap();
+        fs::write(src.join("Storage/ext/abc/data"), "ext").unwrap();
+        fs::write(src.join("Storage/keep/data"), "ok").unwrap();
         std::os::unix::fs::symlink(&root, src.join("escape")).unwrap();
+
         let mut files = 0;
-        copy_tree(&src, &dst, Path::new(""), &mut files).unwrap();
-        assert_eq!(files, 1);
-        assert!(dst.join("Preferences").is_file());
-        assert!(!dst.join("Cache").exists());
-        assert!(fs::symlink_metadata(dst.join("escape")).is_err());
+        copy_tree(&src, &dst_no_ext, Path::new(""), false, &mut files).unwrap();
+        assert_eq!(files, 2);
+        assert!(dst_no_ext.join("Preferences").is_file());
+        assert!(dst_no_ext.join("Storage/keep/data").is_file());
+        assert!(!dst_no_ext.join("Cache").exists());
+        assert!(!dst_no_ext.join("Extensions").exists());
+        assert!(!dst_no_ext.join("Local Extension Settings").exists());
+        assert!(!dst_no_ext.join("Storage/ext").exists());
+        assert!(fs::symlink_metadata(dst_no_ext.join("escape")).is_err());
+
+        let mut files_with_ext = 0;
+        copy_tree(
+            &src,
+            &dst_with_ext,
+            Path::new(""),
+            true,
+            &mut files_with_ext,
+        )
+        .unwrap();
+        assert_eq!(files_with_ext, 5);
+        assert!(dst_with_ext.join("Extensions/abc/manifest.json").is_file());
+        assert!(dst_with_ext
+            .join("Local Extension Settings/abc/data")
+            .is_file());
+        assert!(dst_with_ext.join("Storage/ext/abc/data").is_file());
+
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -436,6 +565,23 @@ mod tests {
     }
 
     #[test]
+    fn kde_session_detection_and_error_note() {
+        assert!(is_kde_session(Some("KDE"), None));
+        assert!(is_kde_session(Some("plasma:kde"), None));
+        assert!(is_kde_session(None, Some("true")));
+        assert!(!is_kde_session(Some("Hyprland"), None));
+        assert!(!is_kde_session(None, Some("")));
+
+        let with_kde = cookie_decrypt_error(&["chrome", "chromium"], true);
+        assert!(with_kde.contains("KDE KWallet"), "{with_kde}");
+        assert!(with_kde.contains("--blank"), "{with_kde}");
+        assert!(with_kde.contains("chrome, chromium"), "{with_kde}");
+
+        let without_kde = cookie_decrypt_error(&["chrome", "chromium"], false);
+        assert!(!without_kde.contains("KWallet"), "{without_kde}");
+    }
+
+    #[test]
     fn reencrypts_v11_cookie_db() {
         let dir = std::env::temp_dir().join(format!("agent-box-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -456,12 +602,25 @@ mod tests {
         let mut bad = b"v11".to_vec();
         bad.extend(encrypt(&key_from_password(b"other"), &plain));
         for ev in [&good, &good, &bad] {
-            conn.execute("INSERT INTO cookies VALUES(?1, ?2)", rusqlite::params![host, ev]).unwrap();
+            conn.execute(
+                "INSERT INTO cookies VALUES(?1, ?2)",
+                rusqlite::params![host, ev],
+            )
+            .unwrap();
         }
         drop(conn);
 
-        let mut report = CloneReport { files: 0, cookies: 0, cookies_dropped: 0, key_source: "none".into() };
-        reencrypt_cookies(&db, &mut report, |app| (app == "chromium").then(|| b"keyring-secret".to_vec())).unwrap();
+        let apps = ["helium", "chromium"];
+        let mut report = CloneReport {
+            files: 0,
+            cookies: 0,
+            cookies_dropped: 0,
+            key_source: "none".into(),
+        };
+        reencrypt_cookies(&db, &apps, false, &mut report, |app| {
+            (app == "chromium").then(|| b"keyring-secret".to_vec())
+        })
+        .unwrap();
         assert_eq!((report.cookies, report.cookies_dropped), (2, 1));
         assert_eq!(report.key_source, "keyring application=chromium");
 
@@ -480,15 +639,31 @@ mod tests {
             assert_eq!(decrypt(&k10, &ev[3..]).unwrap(), plain);
         }
 
-        // No key that works: refuse rather than silently drop every cookie.
+        // No key that works: refuse rather than silently drop every cookie; include KDE note when KDE.
         let db2 = dir.join("Cookies2");
         let _ = fs::remove_file(&db2);
         let conn = rusqlite::Connection::open(&db2).unwrap();
-        conn.execute_batch("CREATE TABLE meta(key TEXT, value TEXT); CREATE TABLE cookies(host_key TEXT, encrypted_value BLOB);").unwrap();
-        conn.execute("INSERT INTO cookies VALUES(?1, ?2)", rusqlite::params![host, &good]).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta(key TEXT, value TEXT); INSERT INTO meta VALUES('version','24');
+             CREATE TABLE cookies(host_key TEXT, encrypted_value BLOB);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cookies VALUES(?1, ?2)",
+            rusqlite::params![host, &good],
+        )
+        .unwrap();
         drop(conn);
-        let mut report = CloneReport { files: 0, cookies: 0, cookies_dropped: 0, key_source: "none".into() };
-        assert!(reencrypt_cookies(&db2, &mut report, |_| None).is_err());
+        let mut report = CloneReport {
+            files: 0,
+            cookies: 0,
+            cookies_dropped: 0,
+            key_source: "none".into(),
+        };
+        let err = reencrypt_cookies(&db2, &["chrome", "chromium"], true, &mut report, |_| None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("KDE KWallet"), "{err}");
 
         // A prefix we do not understand fails loudly.
         let db3 = dir.join("Cookies3");
@@ -499,17 +674,31 @@ mod tests {
              CREATE TABLE cookies(host_key TEXT, encrypted_value BLOB);",
         )
         .unwrap();
-        conn.execute("INSERT INTO cookies VALUES(?1, ?2)", rusqlite::params![host, &good]).unwrap();
-        conn.execute("INSERT INTO cookies VALUES(?1, ?2)", rusqlite::params![host, b"v12xxxxxxxxxxxxxxxx".to_vec()]).unwrap();
+        conn.execute(
+            "INSERT INTO cookies VALUES(?1, ?2)",
+            rusqlite::params![host, &good],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cookies VALUES(?1, ?2)",
+            rusqlite::params![host, b"v12xxxxxxxxxxxxxxxx".to_vec()],
+        )
+        .unwrap();
         drop(conn);
-        let err = reencrypt_cookies(&db3, &mut report, |_| Some(b"keyring-secret".to_vec())).unwrap_err();
+        let err = reencrypt_cookies(&db3, &apps, false, &mut report, |_| {
+            Some(b"keyring-secret".to_vec())
+        })
+        .unwrap_err();
         assert!(err.to_string().contains("v12"), "{err}");
 
         // So does a schema newer than we know.
         let conn = rusqlite::Connection::open(&db3).unwrap();
         conn.execute_batch("DELETE FROM cookies WHERE substr(encrypted_value,1,3)=CAST('v12' AS BLOB); UPDATE meta SET value='25';").unwrap();
         drop(conn);
-        let err = reencrypt_cookies(&db3, &mut report, |_| Some(b"keyring-secret".to_vec())).unwrap_err();
+        let err = reencrypt_cookies(&db3, &apps, false, &mut report, |_| {
+            Some(b"keyring-secret".to_vec())
+        })
+        .unwrap_err();
         assert!(err.to_string().contains("version 25"), "{err}");
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -540,8 +729,11 @@ mod tests {
     #[test]
     fn skip_list_matches_relative_paths() {
         let rel = Path::new("Service Worker").join("CacheStorage");
-        assert!(SKIP.iter().any(|s| Path::new(s) == rel));
+        assert!(should_skip(&rel, false));
         let keep = Path::new("Service Worker").join("ScriptCache");
-        assert!(!SKIP.iter().any(|s| Path::new(s) == keep));
+        assert!(!should_skip(&keep, false));
+        let ext = Path::new("Storage").join("ext");
+        assert!(should_skip(&ext, false));
+        assert!(!should_skip(&ext, true));
     }
 }
