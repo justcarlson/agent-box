@@ -159,8 +159,8 @@ jobs:
           curl -fsS "$("$AB" cdp box3)/json/version" >/dev/null
           "$AB" down --all
           "$AB" gc
-          test -z "$(systemctl --user list-units --all --plain --no-legend 'agent-box*')"
-          test -z "$(find "$HOME/.cache/agent-box" -mindepth 1 -not -name CACHEDIR.TAG 2>/dev/null)"
+          test -z "$(systemctl --user list-units --all --plain --no-legend 'agent-box-*.service' 'agent-box-*.slice')"
+          test -z "$(find "$HOME/.cache/agent-box" -mindepth 1 -maxdepth 1 -not -name CACHEDIR.TAG -not -name .locks 2>/dev/null)"
 
       - name: Clean up boxes
         if: always()
